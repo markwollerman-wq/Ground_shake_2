@@ -1,0 +1,763 @@
+#include "Checks.h"
+#include <cmath>
+#include <algorithm>
+
+namespace gs
+{
+namespace
+{
+    juce::String U (const char* s) { return juce::String::fromUTF8 (s); }
+    const juce::String arrow = U (" \xe2\x86\x92 ");          // " → "
+    const juce::String dash  = U ("\xe2\x80\x93");             // "–"
+
+    juce::String signedDb (float v, int dp = 1)
+    {
+        return (v >= 0 ? "+" : "-") + juce::String (std::abs (v), dp) + " dB";
+    }
+    juce::String absDb (float v, int dp = 1) { return juce::String (std::abs (v), dp) + " dB"; }
+    int round5 (float v) { return (int) (std::round (v / 5.0f) * 5.0f); }
+
+    float wrapSemis (float s)                 // into [-6, 6)
+    {
+        while (s >= 6.0f) s -= 12.0f;
+        while (s < -6.0f) s += 12.0f;
+        return s;
+    }
+
+    int maskFor (std::initializer_list<int> positions)     // a 16th within the beat, on all 4 beats
+    {
+        int m = 0;
+        for (int p : positions)
+            for (int b = 0; b < 4; ++b) m |= 1 << (b * 4 + p);
+        return m;
+    }
+    int beatBits (std::initializer_list<int> positions)
+    {
+        int m = 0;
+        for (int p : positions) m |= 1 << p;
+        return m;
+    }
+}
+
+juce::String checkName (CheckId id)
+{
+    switch (id)
+    {
+        case CheckId::section:    return "Right section";
+        case CheckId::mono:       return "Mono below 120 Hz";
+        case CheckId::tuning:     return "Kick tuning";
+        case CheckId::kickBass:   return "Kick / bass";
+        case CheckId::beatShape:  return "Beat shape";
+        case CheckId::subLevel:   return "Sub level";
+        case CheckId::punch:      return "Kick punch";
+        case CheckId::mud:        return "Low-mid mud";
+        case CheckId::squash:     return "Limiter squash";
+        case CheckId::djPlayback: return "DJ playback";
+        case CheckId::numChecks:
+        case CheckId::fineTune:
+        case CheckId::loudnessGap:
+        case CheckId::keyInfo:
+        case CheckId::oneBeat:
+        case CheckId::thinMud:
+        default: break;
+    }
+    return {};
+}
+
+//==============================================================================
+BeatShape beatShape (const StepProfile& you, const StepProfile& ref)
+{
+    BeatShape b;
+    if (! you.valid || ! ref.valid || you.fullTotal <= 0 || ref.fullTotal <= 0) return b;
+    std::array<float, 4> y {}, r {};
+    for (int k = 0; k < 4; ++k)
+    {
+        double py = 0, pr = 0;
+        for (int beat = 0; beat < 4; ++beat)
+        {
+            const auto s = (size_t) (beat * 4 + k);
+            py += you.feel[s] + kPunchWeight * you.punch[s];
+            pr += ref.feel[s] + kPunchWeight * ref.punch[s];
+        }
+        y[(size_t) k] = powerToDb ((float) (py / 4.0) / you.fullTotal);
+        r[(size_t) k] = powerToDb ((float) (pr / 4.0) / ref.fullTotal);
+    }
+    // line each curve up on its 2nd-4th 16ths (the kick 16th is judged on its own)
+    const float my = (y[1] + y[2] + y[3]) / 3.0f, mr = (r[1] + r[2] + r[3]) / 3.0f;
+    for (size_t k = 0; k < 4; ++k)
+    {
+        b.you[k] = y[k] - my;
+        b.ref[k] = r[k] - mr;
+        b.diff[k] = b.you[k] - b.ref[k];
+    }
+    b.levelDb = my - mr;
+    b.valid = true;
+    return b;
+}
+
+//==============================================================================
+void Coach::reset()
+{
+    tracks = {};
+    hasLastCard = {};
+    snapValid = false;
+    snapHas = {};
+}
+
+void Coach::takeSnapshot()
+{
+    for (int i = 0; i < kNumChecks; ++i)
+    {
+        snapValues[(size_t) i] = tracks[(size_t) i].now;
+        snapHas[(size_t) i] = (size_t) i < rows.size() && rows[(size_t) i].status != Status::waiting
+                              && rows[(size_t) i].status != Status::info;
+    }
+    snapValid = true;
+}
+
+void Coach::update (const CoachInputs& in, double nowSec)
+{
+    rows.clear();
+    fixCards.clear();
+
+    const bool refOk = in.haveRef && in.ref.valid;
+    const bool youOk = in.haveYou && in.you.valid;
+    const bool both = refOk && youOk;
+    const bool bothM = both && in.youM.valid && in.refM.valid;
+    const juce::String R = in.refName.isNotEmpty() ? in.refName : juce::String ("the reference");
+    const double bpm = juce::jlimit (40.0, 300.0, in.hostBpm);
+    const double loopSec = kBars * 240.0 / bpm;
+    const float tol = juce::jlimit (0.25f, 6.0f, in.tolerance);
+
+    const int firstBar = in.windowStartBar + 1, lastBar = in.windowStartBar + in.windowBars;
+    const bool onDrop = in.windowStartBar == in.dropBar;
+    const juce::String comparing = R + " " + dash + " " + (onDrop ? "drop " : juce::String())
+                                   + "(bars " + juce::String (firstBar) + dash + juce::String (lastBar) + ")";
+
+    struct Raw
+    {
+        Status st = Status::waiting;
+        float metric = 0;
+        juce::String value;
+        bool hasCard = false;
+        FixCard card;
+    };
+    std::array<Raw, kNumChecks> raw {};
+    std::vector<FixCard> info;
+
+    auto grade = [] (float mag, float passBelow, float nearBelow)
+    {
+        return mag <= passBelow ? Status::pass : (mag <= nearBelow ? Status::near : Status::fail);
+    };
+    auto newCard = [&] (CheckId id, const juce::String& title, const juce::String& headline)
+    {
+        FixCard c;
+        c.id = id;
+        c.title = title;
+        c.headline = headline;
+        c.comparing = comparing;
+        return c;
+    };
+
+    //--------------------------------------------------------------------------
+    // 1. Right section
+    {
+        auto& r = raw[(size_t) CheckId::section];
+        if (refOk)
+        {
+            r.metric = in.windowVsDropDb;
+            r.st = (in.sectionDismissed || onDrop) ? Status::pass : grade (-in.windowVsDropDb, 2.0f, 4.0f);
+            r.value = onDrop ? juce::String ("drop") : "bars " + juce::String (firstBar) + dash + juce::String (lastBar);
+            if (r.st != Status::pass)
+            {
+                const int d0 = in.dropBar + 1, d1 = in.dropBar + in.windowBars;
+                auto c = newCard (CheckId::section, "COMPARING AGAINST A QUIETER SECTION",
+                                  absDb (in.windowVsDropDb) + " quieter than the drop");
+                c.see = R + "'s bars " + juce::String (firstBar) + dash + juce::String (lastBar) + " are about "
+                        + absDb (in.windowVsDropDb) + " quieter than its drop (bars " + juce::String (d0) + dash
+                        + juce::String (d1) + "). Advice taken from an intro or breakdown can overcorrect your drop, "
+                          "so the other fixes wait until this one is sorted.";
+                c.cause = "The 8-bar window isn't on the reference's main drop.";
+                c.how.add ("Press FIND THE DROP to jump the window to bars " + juce::String (d0) + dash + juce::String (d1) + ".");
+                c.how.add ("If your loop is also an intro or breakdown, press THAT'S INTENDED.");
+                c.worked = "Comparing to reads \"drop\".";
+                c.offerFindDrop = c.offerDismiss = true;
+                r.hasCard = true;  r.card = c;
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 2. Mono below 120 Hz
+    if (youOk && in.youM.valid)
+    {
+        auto& r = raw[(size_t) CheckId::mono];
+        const float corr = in.youM.monoCorr;
+        r.metric = corr;
+        r.value = juce::String (corr, 2);
+        r.st = corr >= 0.90f ? Status::pass : (corr >= 0.75f ? Status::near : Status::fail);
+        if (r.st != Status::pass)
+        {
+            auto c = newCard (CheckId::mono, "LOW END ISN'T MONO", "correlation " + juce::String (corr, 2) + " below 120 Hz");
+            c.see = "Below 120 Hz your left and right channels only line up " + juce::String (juce::roundToInt (corr * 100.0f))
+                    + "%" + (in.refM.valid ? " (" + R + ": " + juce::String (juce::roundToInt (in.refM.monoCorr * 100.0f)) + "%)" : juce::String())
+                    + ". On a mono club sub, part of your low end cancels out.";
+            c.cause = "A wide or chorused sub layer, stereo unison on the bass oscillator, or a stereo reverb or delay reaching below 120 Hz.";
+            c.how.add ("Put Ableton's Utility on the bass: turn on Bass Mono and set it to 120 Hz.");
+            c.how.add ("Do the same on any other wide low layer (sub pads, reverb returns), or once on the master before the limiter.");
+            c.how.add ("On the bass synth, turn off stereo unison or chorus for the sub oscillator.");
+            c.worked = "The Mono check ticks (correlation 0.90 or higher).";
+            c.tooFar = "You can't overdo this one.";
+            c.watch = "The sub level can shift slightly once it's mono.";
+            r.hasCard = true;  r.card = c;
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 3. Kick tuning (an estimate from the finished mix: yellow at most, never red)
+    if (bothM)
+    {
+        auto& r = raw[(size_t) CheckId::tuning];
+        const auto& y = in.youM;
+        const auto& f = in.refM;
+        const bool clear = y.bassConf >= 5 && y.kickConf >= 4 && f.bassConf >= 5 && f.kickConf >= 4;
+        if (! clear)
+        {
+            r.st = Status::info;
+            r.value = "unclear";
+        }
+        else
+        {
+            const float yourRel = wrapSemis (semitonesBetween (y.bassHz, y.kickHz));
+            const float refRel = wrapSemis (semitonesBetween (f.bassHz, f.kickHz));
+            const float dev = wrapSemis (yourRel - refRel);
+            r.metric = dev;
+            r.value = (dev >= 0 ? "+" : "-") + juce::String (std::abs (dev), 1) + " st";
+            r.st = std::abs (dev) < 0.6f ? Status::pass : Status::near;
+            if (r.st != Status::pass)
+            {
+                const int move = -juce::roundToInt (dev);
+                auto c = newCard (CheckId::tuning, "KICK MAY NOT BE TUNED TO YOUR BASS",
+                                  "about " + juce::String (std::abs (dev), 1) + " semitones off");
+                c.see = "Your kick seems to settle near " + noteName (y.kickHz) + " (" + juce::String (y.kickHz, 0)
+                        + " Hz) over a bass on " + noteName (y.bassHz) + " (" + juce::String (y.bassHz, 0) + " Hz). "
+                        + "Compared with how " + R + "'s kick sits on its bass, yours is about "
+                        + juce::String (std::abs (dev), 1) + " semitones " + (dev > 0 ? "sharp." : "flat.");
+                c.cause = "The kick sample's pitch doesn't follow the bass note.";
+                c.how.add ("Tune the kick about " + juce::String (move > 0 ? "+" : "") + juce::String (move == 0 ? (dev > 0 ? -1 : 1) : move)
+                           + " semitones (Simpler or Sampler: Transpose, or your kick synth's pitch).");
+                c.how.add ("Listen with the bass: the kick's tail should blend into the bass note, not beat against it.");
+                c.how.add ("This is an estimate from the finished mix. If your ears disagree, trust them.");
+                c.worked = "The Kick tuning check ticks (within about half a semitone).";
+                c.tooFar = "If the kick starts to sound thin or boomy, go back halfway.";
+                c.watch = "A retuned kick can make a new clash on a different note.";
+                r.hasCard = true;  r.card = c;
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 4 + 5. Kick/bass on the kick 16th, and the beat shape (the sidechain)
+    const auto bs = beatShape (in.you, in.ref);
+    if (both && bs.valid)
+    {
+        {
+            auto& r = raw[(size_t) CheckId::kickBass];
+            const float s0 = bs.diff[0];
+            r.metric = s0;
+            r.value = signedDb (s0);
+            r.st = grade (std::abs (s0), 2.0f, 3.0f);
+            if (r.st != Status::pass)
+            {
+                const int n = round5 (juce::jlimit (5.0f, 30.0f, 4.0f * std::abs (s0)));
+                FixCard c;
+                if (s0 > 0)
+                {
+                    c = newCard (CheckId::kickBass, "KICK AND BASS PILE UP ON THE KICK", signedDb (s0) + " on the 1st 16th");
+                    c.see = "On the 1st 16th of every beat your sub is " + absDb (s0) + " fuller than " + R
+                            + "'s (levels lined up). The bass is still sounding when the kick hits.";
+                    c.cause = "The Kickstart 2 duck isn't deep enough right at the kick, or the kick's tail rings into the bass.";
+                    c.how.add ("Kickstart 2: raise MIX about " + juce::String (n) + "% for a deeper duck at the kick.");
+                    c.how.add ("Or pick a shape that starts right at the bottom on its left edge.");
+                    c.how.add ("Or shorten the kick's decay so its tail ends before the bass comes back.");
+                    c.tooFar = "The bars on 1, 5, 9 and 13 drop below " + R + "'s: lower MIX about 5% at a time.";
+                }
+                else
+                {
+                    c = newCard (CheckId::kickBass, "KICK 16th IS THIN", signedDb (s0) + " on the 1st 16th");
+                    c.see = "On the 1st 16th of every beat your sub is " + absDb (s0) + " lighter than " + R + "'s (levels lined up).";
+                    c.cause = "The duck is too deep right at the kick, or the bass is out of phase with the kick's tail and cancels it.";
+                    c.how.add ("Kickstart 2: lower MIX about " + juce::String (n) + "%.");
+                    c.how.add ("Flip the bass polarity (Utility: Phase L and R). Keep whichever makes the 1st-16th bars fuller.");
+                    c.how.add ("Or let the kick's tail run a little longer.");
+                    c.tooFar = "The bars on 1, 5, 9 and 13 grow taller than " + R + "'s: raise MIX about 5%.";
+                }
+                c.worked = "The 1st-16th bars (1, 5, 9, 13) line up with " + R + "'s.";
+                c.watch = "A deeper or shallower duck also moves the 2nd 16th: watch Beat shape.";
+                c.highlightMask = maskFor ({ 0 });
+                c.beatMask = beatBits ({ 0 });
+                c.beatGraph = true;
+                r.hasCard = true;  r.card = c;
+            }
+        }
+        {
+            auto& r = raw[(size_t) CheckId::beatShape];
+            const float s1 = bs.diff[1], s3 = bs.diff[3];
+            const float lump = (bs.you[1] - bs.you[2]) - (bs.ref[1] - bs.ref[2]);
+            struct Cand { int kind; float mag; float signedVal; };
+            std::vector<Cand> cands {
+                { 0, s3, s3 },          // too full before the kick
+                { 1, -s3, s3 },         // ducking more than the reference
+                { 2, -s1, s1 },         // coming back too late
+                { 3, std::abs (lump) * 0.8f, lump } };   // a lumpy roll matters a little less
+            auto worst = *std::max_element (cands.begin(), cands.end(), [] (auto& a, auto& b) { return a.mag < b.mag; });
+            r.metric = worst.signedVal;
+            r.st = grade (std::max (0.0f, worst.mag), 2.0f, 3.0f);
+            r.value = r.st == Status::pass ? juce::String ("matches")
+                                           : signedDb (worst.signedVal) + (worst.kind <= 1 ? " 4th" : (worst.kind == 2 ? " 2nd" : " roll"));
+            if (r.st != Status::pass)
+            {
+                FixCard c;
+                const float beatMs = (float) (60000.0 / bpm);
+                if (worst.kind == 0)
+                {
+                    const float depth = juce::jlimit (3.0f, 26.0f, 2.0f * s3);
+                    const int mix = juce::jlimit (50, 100, round5 (100.0f * (1.0f - std::pow (10.0f, -depth / 20.0f))));
+                    c = newCard (CheckId::beatShape, "BASS RUNS INTO THE KICK", signedDb (s3) + " on the 4th 16th");
+                    c.see = "Your bass is full right before every kick; " + R + " takes a breath there ("
+                            + absDb (s3) + " lower, levels lined up).";
+                    c.cause = "Kickstart 2 opens and stays open until the next kick.";
+                    c.how.add ("Keep 1/4 and AUDIO.");
+                    c.how.add ("Pick a shape whose right edge drops before the end (row 2, 3rd shape).");
+                    c.how.add ("Set MIX to about " + juce::String (mix) + "% (about -" + juce::String (juce::roundToInt (depth))
+                               + " dB at the bottom of the duck). Already on that shape? Raise MIX about 10%.");
+                    c.how.add ("MIDI option: end each bass note at about 75% of the beat (" + juce::String (juce::roundToInt (beatMs * 0.75f))
+                               + " ms after the kick at " + juce::String (bpm, 0) + " BPM).");
+                    c.worked = "The ^ on 16ths 4, 8, 12 and 16 disappears and the 4th-16th bars match " + R + "'s.";
+                    c.tooFar = "They turn into v: lower MIX about 10% at a time.";
+                    c.highlightMask = maskFor ({ 3 });
+                    c.beatMask = beatBits ({ 3 });
+                }
+                else if (worst.kind == 1)
+                {
+                    const int n = round5 (juce::jlimit (5.0f, 30.0f, 5.0f * std::abs (s3)));
+                    c = newCard (CheckId::beatShape, "YOU'RE DUCKING MORE THAN THE REFERENCE", signedDb (s3) + " on the 4th 16th");
+                    c.see = "Your 4th 16ths are " + absDb (s3) + " lighter than " + R
+                            + "'s (levels lined up): you leave a gap before the kick that " + R + " doesn't.";
+                    c.cause = "The Kickstart 2 shape drops too early or too deep before the kick.";
+                    c.how.add ("Kickstart 2: lower MIX about " + juce::String (n) + "%.");
+                    c.how.add ("Or pick a shape whose right edge drops later (closer to the end).");
+                    c.how.add ("If the bass notes are short, lengthen them to the end of the beat.");
+                    c.worked = "The v on 16ths 4, 8, 12 and 16 disappears.";
+                    c.tooFar = "They turn into ^: raise MIX about 5%.";
+                    c.highlightMask = maskFor ({ 3 });
+                    c.beatMask = beatBits ({ 3 });
+                }
+                else if (worst.kind == 2)
+                {
+                    const int n = round5 (juce::jlimit (5.0f, 25.0f, 4.0f * std::abs (s1)));
+                    c = newCard (CheckId::beatShape, "BASS COMES BACK TOO LATE AFTER THE KICK", signedDb (s1) + " on the 2nd 16th");
+                    c.see = "Your 2nd 16ths are " + absDb (s1) + " lighter than " + R
+                            + "'s (levels lined up): your bass is still ducked when " + R + " is already rolling.";
+                    c.cause = "Kickstart 2's curve rises too slowly, or MIX is set very deep.";
+                    c.how.add ("Kickstart 2: pick a shape with a steeper left edge (a faster rise).");
+                    c.how.add ("Or lower MIX about " + juce::String (n) + "%.");
+                    c.how.add ("Check that the bass notes start right on the 2nd 16th, not later.");
+                    c.worked = "The 2nd-16th bars (2, 6, 10, 14) match " + R + "'s.";
+                    c.tooFar = "The kick 16th starts to pile up (Kick / bass check): use a slightly slower rise.";
+                    c.highlightMask = maskFor ({ 1 });
+                    c.beatMask = beatBits ({ 1 });
+                }
+                else
+                {
+                    const float yourGap = bs.you[1] - bs.you[2], refGap = bs.ref[1] - bs.ref[2];
+                    c = newCard (CheckId::beatShape, "YOUR ROLL IS LUMPY", "2nd vs 3rd 16th off by " + absDb (lump));
+                    c.see = "In your roll the 2nd 16th sits " + absDb (yourGap) + (yourGap >= 0 ? " above" : " below")
+                            + " the 3rd; in " + R + " it sits " + absDb (refGap) + (refGap >= 0 ? " above" : " below")
+                            + ". The roll has a different weight from the reference's.";
+                    c.cause = "The bass notes themselves: velocity, note length or envelope differ between the 16ths. "
+                              "Not Kickstart: its curve is open on both.";
+                    c.how.add ("Even out velocities: lower the " + juce::String (lump > 0 ? "2nd" : "3rd")
+                               + "-16th bass notes by about " + absDb (lump * 0.7f) + " (or raise the other one).");
+                    c.how.add ("Or give the bass gentle compression (about 2:1, fast attack) to even the roll.");
+                    c.how.add ("Check the note lengths: a longer note on one 16th sounds louder.");
+                    c.worked = "The 2nd- and 3rd-16th bars sit like " + R + "'s.";
+                    c.tooFar = "The other 16th becomes the loud one: go back halfway.";
+                    c.highlightMask = maskFor ({ 1, 2 });
+                    c.beatMask = beatBits ({ 1, 2 });
+                }
+                c.beatGraph = true;
+                c.watch = "Changing the duck moves the overall sub level: fix this before Sub level.";
+                r.hasCard = true;  r.card = c;
+            }
+        }
+
+        // one beat in each bar different (a fill or arrangement difference): information only
+        {
+            std::array<float, 4> e {};
+            for (int beat = 0; beat < 4; ++beat)
+            {
+                double py = 0, pr = 0;
+                for (int k = 0; k < 4; ++k)
+                {
+                    const auto s = (size_t) (beat * 4 + k);
+                    py += in.you.feel[s] + kPunchWeight * in.you.punch[s];
+                    pr += in.ref.feel[s] + kPunchWeight * in.ref.punch[s];
+                }
+                e[(size_t) beat] = powerToDb ((float) py / in.you.fullTotal) - powerToDb ((float) pr / in.ref.fullTotal);
+            }
+            const float mean = (e[0] + e[1] + e[2] + e[3]) / 4.0f;
+            int odd = -1, calm = 0;
+            for (int b = 0; b < 4; ++b)
+            {
+                const float x = std::abs (e[(size_t) b] - mean);
+                if (x >= 3.0f) odd = (odd == -1 ? b : 99);
+                else if (x <= 1.5f) ++calm;
+            }
+            if (odd >= 0 && odd < 4 && calm == 3)
+            {
+                auto c = newCard (CheckId::oneBeat, "BEAT " + juce::String (odd + 1) + " OF EACH BAR DIFFERS",
+                                  signedDb (e[(size_t) odd] - mean) + " on beat " + juce::String (odd + 1));
+                c.severity = Status::info;
+                c.see = "Beat " + juce::String (odd + 1) + " carries " + absDb (e[(size_t) odd] - mean)
+                        + (e[(size_t) odd] > mean ? " more" : " less") + " sub than " + R + "'s, while the other beats match.";
+                c.cause = "Usually a fill, a drum edit or an arrangement difference, not a mix problem.";
+                c.how.add ("Nothing to fix unless it sounds wrong. Listen to beat " + juce::String (odd + 1) + " with A/B.");
+                c.highlightMask = 0xF << (odd * 4);
+                info.push_back (c);
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 6. Sub level
+    if (both)
+    {
+        auto& r = raw[(size_t) CheckId::subLevel];
+        const float d = in.you.shakeDb() - in.ref.shakeDb();
+        r.metric = d;
+        r.value = signedDb (d);
+        r.st = std::abs (d) <= tol ? Status::pass : (std::abs (d) <= 3.0f ? Status::near : Status::fail);
+        if (r.st != Status::pass)
+        {
+            FixCard c;
+            if (d > 0)
+            {
+                c = newCard (CheckId::subLevel, "SUB TOO LOUD", signedDb (d) + " vs " + R);
+                c.see = "Your sub is " + absDb (d) + " over " + R + "'s across the whole loop, as a share of the mix, so loudness can't fool it.";
+                c.cause = "The bass or sub layer is turned up too far, or the kick's low end is heavy.";
+                c.how.add ("Bass fader about " + signedDb (-d) + " (or the sub layer, if you have one).");
+                c.how.add ("Or Kickstart 2: raise MIX about 5-10% to duck a little more.");
+                c.how.add ("If the 1st-16th bars are what's tall, lower the kick instead.");
+            }
+            else
+            {
+                c = newCard (CheckId::subLevel, "SUB TOO QUIET", signedDb (d) + " vs " + R);
+                c.see = "Your sub is " + absDb (d) + " under " + R + "'s across the whole loop, as a share of the mix, so loudness can't fool it.";
+                c.cause = "The bass or sub layer is too low, or the duck takes out too much.";
+                c.how.add ("Bass fader about " + signedDb (-d) + " (or the sub layer, if you have one).");
+                c.how.add ("Or Kickstart 2: lower MIX about 5-10% to duck a little less.");
+                c.how.add ("Check the step grid for dim bars (gaps): filling them adds sub without more level.");
+                c.watch = "Raising the bass can add limiter squash and mud: watch those checks.";
+            }
+            c.worked = "Your foot turns green (within " + juce::String (tol, 1) + " dB).";
+            c.tooFar = "It flips to the other side by more than " + juce::String (tol, 1) + " dB: go back halfway.";
+            r.hasCard = true;  r.card = c;
+        }
+        else if (std::abs (d) > 0.5f)
+        {
+            const int n = juce::jlimit (2, 10, juce::roundToInt (std::abs (d) * 5.0f));
+            auto c = newCard (CheckId::fineTune, "FINE-TUNE THE LAST dB", signedDb (d) + " vs " + R);
+            c.severity = Status::info;
+            c.see = "You're inside the green zone, " + absDb (d) + (d > 0 ? " over " : " under ") + R + ".";
+            c.cause = "Optional: closing the last fraction.";
+            c.how.add ("Bass fader about " + signedDb (-d) + ", or Kickstart 2 MIX about " + juce::String (d > 0 ? "+" : "-")
+                       + juce::String (n) + "%.");
+            c.how.add ("Let the loop play two or three passes after each move before you read it.");
+            c.how.add ("Finer than 0.5 dB is below the loop-to-loop variation: no need to chase it.");
+            info.push_back (c);
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 7. Kick punch (the punch zone)
+    if (both)
+    {
+        auto& r = raw[(size_t) CheckId::punch];
+        const float d = in.you.punchDb() - in.ref.punchDb();
+        const float thr = std::max (1.5f, tol * 1.5f);
+        r.metric = d;
+        r.value = signedDb (d);
+        r.st = std::abs (d) <= thr ? Status::pass : (std::abs (d) <= thr + 2.0f ? Status::near : Status::fail);
+        if (r.st != Status::pass)
+        {
+            auto c = newCard (CheckId::punch, d > 0 ? "KICK PUNCH TOO LOUD" : "KICK PUNCH TOO QUIET", signedDb (d) + " in the punch zone");
+            c.see = "The punch zone (kick thump and bass body) is " + absDb (d) + (d > 0 ? " over " : " under ") + R
+                    + "'s, as a share of the mix.";
+            c.cause = d > 0 ? "A heavy kick body, or a bass with a lot of 60-120 Hz." : "A thin kick, or a bass low-passed too far.";
+            if (d > 0)
+            {
+                c.how.add ("Lower the kick about " + absDb (d) + ", or cut about " + absDb (d) + " around 70-90 Hz on the kick.");
+                c.how.add ("If the bass carries a lot of 60-120 Hz, cut there on the bass instead.");
+            }
+            else
+            {
+                c.how.add ("Raise the kick about " + absDb (d) + ", or boost about " + absDb (d) + " around 70-90 Hz on the kick.");
+                c.how.add ("Or let more of the bass's body through: open its low-pass a little.");
+            }
+            c.worked = "The Kick punch check ticks.";
+            c.tooFar = "It reads the other way by more than " + juce::String (thr, 1) + " dB: go back halfway.";
+            c.watch = "Kick changes also move Kick / bass and Sub level.";
+            c.highlightMask = maskFor ({ 0 });
+            r.hasCard = true;  r.card = c;
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 8. Low-mid mud
+    if (both)
+    {
+        auto& r = raw[(size_t) CheckId::mud];
+        const float dm = in.you.mudDb() - in.ref.mudDb();
+        r.metric = dm;
+        r.value = signedDb (dm);
+        r.st = dm <= 2.0f ? Status::pass : (dm <= 4.0f ? Status::near : Status::fail);
+        if (r.st != Status::pass)
+        {
+            std::array<std::pair<float, int>, kStepsPerBar> per {};
+            for (int s = 0; s < kStepsPerBar; ++s)
+                per[(size_t) s] = { in.you.stepMudDb (s) - in.ref.stepMudDb (s), s };
+            std::sort (per.begin(), per.end(), [] (auto& a, auto& b) { return a.first > b.first; });
+            int mask = 0;
+            juce::StringArray where;
+            for (int i = 0; i < 3; ++i) { mask |= 1 << per[(size_t) i].second; where.add (juce::String (per[(size_t) i].second + 1)); }
+            auto c = newCard (CheckId::mud, "LOW-MID MUD", signedDb (dm) + " vs " + R);
+            c.see = "Your 150-400 Hz low-mids are " + absDb (dm) + " over " + R + "'s, as a share of the mix (worst on 16ths "
+                    + where.joinIntoString (", ") + "). Too much low-mid makes even a big sub sound woolly.";
+            c.cause = "Bass harmonics, kick body, pads, reverb tails and plucks piling up around 200-300 Hz.";
+            c.how.add ("Cut 2-3 dB around 250 Hz on the bass or pads, not the master.");
+            c.how.add ("High-pass reverb and delay returns at about 200 Hz.");
+            c.how.add ("Solo tracks to find the one that fills 150-400 Hz: Ground Shake hears only the finished master.");
+            c.worked = "The Mud check ticks (within 2 dB of " + R + ").";
+            c.tooFar = "The bass vanishes on small speakers: give a little back.";
+            c.watch = "Cutting mud can tempt a sub boost: check Limiter squash after.";
+            c.highlightMask = mask;
+            r.hasCard = true;  r.card = c;
+        }
+        else if (dm <= -4.0f)
+        {
+            auto c = newCard (CheckId::thinMud, "THINNER LOW-MIDS THAN THE REFERENCE", signedDb (dm) + " vs " + R);
+            c.severity = Status::info;
+            c.see = "Your 150-400 Hz low-mids are " + absDb (dm) + " under " + R + "'s. That's clean, but the bass may sound smaller on small speakers.";
+            c.cause = "Information only: a choice, not a mistake.";
+            c.how.add ("If the bass disappears on laptop speakers, add a little 150-300 Hz to the bass (saturation or a gentle boost).");
+            info.push_back (c);
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 9. Limiter squash (sub crest compared with the reference)
+    if (bothM)
+    {
+        auto& r = raw[(size_t) CheckId::squash];
+        const float sq = in.refM.subCrestDb - in.youM.subCrestDb;
+        r.metric = sq;
+        r.value = sq > 0 ? signedDb (-sq) : juce::String ("OK");
+        r.st = grade (sq, 2.0f, 4.0f);
+        if (r.st != Status::pass)
+        {
+            auto c = newCard (CheckId::squash, "LIMITER IS FLATTENING THE SUB", "sub peaks " + absDb (sq) + " flatter than " + R);
+            c.see = "Your sub hits stand " + absDb (sq) + " less above their average than " + R
+                    + "'s: the limiter is squashing the kick and bass peaks.";
+            c.cause = "Too much gain into the limiter, or a fast limiter catching every kick.";
+            c.how.add ("Lower the limiter's input gain about " + absDb (sq) + ".");
+            c.how.add ("Or lower the sub about 1-2 dB so the limiter works less.");
+            c.how.add ("Or put a gentle clipper on the kick before the limiter so it takes the peaks instead.");
+            c.worked = "The Limiter squash check ticks (within 2 dB of " + R + "'s punch).";
+            c.tooFar = "Too little limiting makes you quieter than " + R + ": see the loudness card.";
+            c.watch = "Less limiting means less loudness: rekordbox will turn you up more (DJ playback).";
+            r.hasCard = true;  r.card = c;
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // 10. DJ playback (rekordbox Auto Gain), plus the loudness gap
+    if (youOk && in.youM.valid && in.youM.lufs > -60.0f)
+    {
+        auto& r = raw[(size_t) CheckId::djPlayback];
+        const float gain = in.djRefLevel - in.youM.lufs;
+        const float over = in.youM.peakDb + gain;
+        r.metric = over;
+        r.value = over > 0 ? signedDb (over) + " over" : juce::String ("OK");
+        r.st = grade (over, 1.0f, 3.0f);
+        if (r.st != Status::pass)
+        {
+            auto c = newCard (CheckId::djPlayback, "DJ PLAYBACK: REKORDBOX WILL SQUASH YOUR SUB",
+                              "peaks " + signedDb (over) + " over 0 dBFS");
+            c.see = "rekordbox Auto Gain (reference " + juce::String (in.djRefLevel, 0) + " dB) would boost your track about "
+                    + signedDb (gain) + ", pushing your peaks about " + absDb (over) + " over 0 dBFS, where its limiter flattens the kick.";
+            c.cause = "Your track measures quieter (" + juce::String (in.youM.lufs, 1) + " LUFS) than Auto Gain's target, but its peaks already sit near 0 dB.";
+            c.how.add ("Get loudness with less sub peak: lower the sub about 1-2 dB, then push the limiter input about " + absDb (gain) + ".");
+            c.how.add ("Or lower the sub about " + absDb (over) + ".");
+            c.how.add ("Estimate only: rekordbox's analysis differs a little from LUFS.");
+            c.worked = "The DJ playback check ticks (under 1 dB over).";
+            c.watch = "Pushing the limiter adds squash: watch Limiter squash.";
+            r.hasCard = true;  r.card = c;
+        }
+
+        if (in.refM.valid && in.refM.lufs > -60.0f)
+        {
+            const float gap = in.refM.lufs - in.youM.lufs;        // > 0: you're quieter
+            if (std::abs (gap) >= 1.0f)
+            {
+                auto c = newCard (CheckId::loudnessGap, gap > 0 ? "QUIETER THAN THE REFERENCE" : "LOUDER THAN THE REFERENCE",
+                                  absDb (gap) + (gap > 0 ? " quieter" : " louder") + " than " + R);
+                c.severity = Status::info;
+                c.see = "Your loop measures " + juce::String (in.youM.lufs, 1) + " LUFS; " + R + "'s window measures "
+                        + juce::String (in.refM.lufs, 1) + " LUFS. rekordbox Auto Gain will turn yours "
+                        + (gap > 0 ? "up" : "down") + " about " + absDb (gap) + " more than " + R
+                        + ": that's the extra trim you'd need.";
+                c.cause = "Loudness, not the sub: the sub reading is level-matched and ignores this on purpose.";
+                if (gap > 0)
+                {
+                    c.how.add ("To close it at the source, raise the limiter's input gain about " + absDb (gap) + ".");
+                    c.how.add ("Watch Limiter squash and DJ playback while you push.");
+                }
+                else
+                {
+                    c.how.add ("If you want to sit level with " + R + ", lower the limiter's input about " + absDb (gap) + ".");
+                    c.how.add ("Less limiting also gives the sub its punch back (Limiter squash). Louder is fine if Squash and DJ playback stay green.");
+                }
+                info.push_back (c);
+            }
+        }
+    }
+
+    // key: information only
+    if (bothM && in.youM.keyIndex >= 0 && in.refM.keyIndex >= 0 && in.youM.keyConf >= 0.05f && in.refM.keyConf >= 0.05f
+        && (in.youM.keyIndex != in.refM.keyIndex || in.youM.keyMinor != in.refM.keyMinor))
+    {
+        auto c = newCard (CheckId::keyInfo, "DIFFERENT KEY FROM THE REFERENCE",
+                          keyName (in.youM.keyIndex, in.youM.keyMinor) + " vs " + keyName (in.refM.keyIndex, in.refM.keyMinor));
+        c.severity = Status::info;
+        c.see = "You: " + keyName (in.youM.keyIndex, in.youM.keyMinor) + ". " + R + ": " + keyName (in.refM.keyIndex, in.refM.keyMinor) + ".";
+        c.cause = "Information only: tracks in different keys can still match their low end.";
+        c.how.add ("Nothing to fix. A different bass note does change how deep the sub feels, which the Range knob's Auto setting allows for.");
+        info.push_back (c);
+    }
+
+    //--------------------------------------------------------------------------
+    // hold-for-one-loop ticking, progress, rows and cards
+    float scoreSum = 0;
+    int scored = 0;
+    bool firstSet = false;
+    for (int i = 0; i < kNumChecks; ++i)
+    {
+        auto& r = raw[(size_t) i];
+        auto& t = tracks[(size_t) i];
+        const auto id = (CheckId) i;
+        Status shown = r.st;
+        t.now = r.metric;
+
+        if (r.st == Status::pass)
+        {
+            if (t.passSince < 0) t.passSince = nowSec;
+            t.ticked = t.ticked || (nowSec - t.passSince) >= loopSec;
+            shown = t.ticked ? Status::pass : Status::holding;
+        }
+        else
+        {
+            t.passSince = -1.0;
+            t.ticked = false;
+        }
+        if ((r.st == Status::near || r.st == Status::fail) && ! t.hasStart)
+        {
+            t.hasStart = true;
+            t.start = r.metric;
+        }
+
+        rows.push_back ({ id, checkName (id), shown, r.value });
+
+        if (shown == Status::pass || shown == Status::waiting || shown == Status::info) {}
+        else
+        {
+            FixCard c;
+            if (r.hasCard)
+            {
+                c = r.card;
+                c.severity = r.st;
+                lastCard[(size_t) i] = c;
+                hasLastCard[(size_t) i] = true;
+            }
+            else if (shown == Status::holding && hasLastCard[(size_t) i])
+            {
+                c = lastCard[(size_t) i];
+                c.severity = Status::holding;
+            }
+            else
+                c.id = CheckId::numChecks;      // nothing to show
+
+            if (c.id != CheckId::numChecks)
+            {
+            // progress: snapshot (or where this card started) -> now
+            {
+                const bool useSnap = snapValid && snapHas[(size_t) i];
+                const float base = useSnap ? snapValues[(size_t) i] : t.start;
+                auto fmt = [id] (float v)
+                {
+                    if (id == CheckId::mono) return juce::String (v, 2);
+                    if (id == CheckId::tuning) return (v >= 0 ? "+" : "-") + juce::String (std::abs (v), 1) + " st";
+                    return signedDb (v);
+                };
+                if ((t.hasStart || useSnap) && std::abs (base - r.metric) >= 0.05f)
+                    c.progress = (useSnap ? "snapshot " : juce::String()) + fmt (base) + arrow + fmt (r.metric)
+                                 + (shown == Status::holding ? U (" \xe2\x9c\x93 holding for one loop pass") : juce::String());
+            }
+            if (! firstSet && shown != Status::holding)
+            {
+                c.fixFirst = true;
+                firstSet = true;
+            }
+            fixCards.push_back (c);
+            }
+        }
+        switch (shown)
+        {
+            case Status::pass:    scoreSum += 1.0f; ++scored; break;
+            case Status::holding: scoreSum += 0.9f; ++scored; break;
+            case Status::near:    scoreSum += 0.5f; ++scored; break;
+            case Status::fail:    ++scored; break;
+            case Status::waiting:
+            case Status::info:
+            default: break;
+        }
+    }
+    // comparing against the wrong section: every other card would be misleading, so only that one shows
+    if (raw[(size_t) CheckId::section].st == Status::near || raw[(size_t) CheckId::section].st == Status::fail)
+        fixCards.erase (std::remove_if (fixCards.begin(), fixCards.end(),
+                                        [] (const FixCard& c) { return c.id != CheckId::section; }),
+                        fixCards.end());
+    else
+        for (auto& c : info) fixCards.push_back (c);
+    percent = scored >= 3 ? 100.0f * scoreSum / (float) scored : -1.0f;
+
+    // one-line status for the header
+    if (! refOk)          status = "Load a reference track (or drop it here), then play your 8-bar loop.";
+    else if (! youOk)     status = "Play your loop in Ableton. Ground Shake listens after the limiter.";
+    else
+    {
+        const FixCard* top = nullptr;
+        for (auto& c : fixCards) if (c.fixFirst) { top = &c; break; }
+        if (top != nullptr)
+            status = "Fix this first: " + top->title.substring (0, 1) + top->title.substring (1).toLowerCase()
+                     + " (" + top->headline + ").";
+        else
+        {
+            bool anyHolding = false;
+            for (auto& rw : rows) anyHolding = anyHolding || rw.status == Status::holding;
+            status = anyHolding ? "Looking good: holding each fix for one loop pass before it ticks."
+                                : "Your feet shake like the reference. Locked in.";
+        }
+    }
+}
+} // namespace gs
