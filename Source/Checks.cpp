@@ -31,6 +31,35 @@ namespace
             for (int b = 0; b < 4; ++b) m |= 1 << (b * 4 + p);
         return m;
     }
+    // sub level of some 16th positions within the beat (0 = kick 16th), share of the mix in dB
+    float zoneDb (const StepProfile& p, std::initializer_list<int> positions)
+    {
+        double sum = 0;
+        int n = 0;
+        for (int beat = 0; beat < 4; ++beat)
+            for (int k : positions)
+            {
+                const auto st = (size_t) (beat * 4 + k);
+                sum += p.feel[st] + kPunchWeight * p.punch[st];
+                ++n;
+            }
+        return powerToDb ((float) (sum / std::max (1, n)) / std::max (1.0e-12f, p.fullTotal));
+    }
+
+    // "it's the roll, not the kick": which part of the beat carries the difference
+    juce::String whoIsIt (const StepProfile& you, const StepProfile& ref, bool over)
+    {
+        const float k = zoneDb (you, { 0 }) - zoneDb (ref, { 0 });
+        const float r = zoneDb (you, { 1, 2, 3 }) - zoneDb (ref, { 1, 2, 3 });
+        const juce::String dir = over ? " over" : " under";
+        auto f = [] (float v) { return juce::String (std::abs (v), 1) + " dB"; };
+        if ((over ? r - k : k - r) >= 2.5f)
+            return " It's mostly the roll, not the kick: the bass 16ths are " + f (r) + dir + ", the kick 16ths " + f (k) + ".";
+        if ((over ? k - r : r - k) >= 2.5f)
+            return " It's mostly the kick 16ths (" + f (k) + dir + "); the roll is " + f (r) + ".";
+        return " The kick 16ths and the roll are both about the same amount" + dir + ".";
+    }
+
     int beatBits (std::initializer_list<int> positions)
     {
         int m = 0;
@@ -126,12 +155,14 @@ void Coach::update (const CoachInputs& in, double nowSec)
     const bool bothM = both && in.youM.valid && in.refM.valid;
     const juce::String R = in.refName.isNotEmpty() ? in.refName : juce::String ("the reference");
     const double bpm = juce::jlimit (40.0, 300.0, in.hostBpm);
-    const double loopSec = kBars * 240.0 / bpm;
+    const double loopSec = juce::jlimit (1, kBars, in.windowBars) * 240.0 / bpm;
+    const bool bd = in.breakdownMode;
     const float tol = juce::jlimit (0.25f, 6.0f, in.tolerance);
 
     const int firstBar = in.windowStartBar + 1, lastBar = in.windowStartBar + in.windowBars;
     const bool onDrop = in.windowStartBar == in.dropBar;
-    const juce::String comparing = R + " " + dash + " " + (onDrop ? "drop " : juce::String())
+    const bool onBreakdown = bd && in.windowStartBar == in.breakdownBar;
+    const juce::String comparing = R + " " + dash + " " + (bd ? "breakdown " : (onDrop ? "drop " : juce::String()))
                                    + "(bars " + juce::String (firstBar) + dash + juce::String (lastBar) + ")";
 
     struct Raw
@@ -167,8 +198,26 @@ void Coach::update (const CoachInputs& in, double nowSec)
         {
             r.metric = in.windowVsDropDb;
             r.st = (in.sectionDismissed || onDrop) ? Status::pass : grade (-in.windowVsDropDb, 2.0f, 4.0f);
-            r.value = onDrop ? juce::String ("drop") : "bars " + juce::String (firstBar) + dash + juce::String (lastBar);
-            if (r.st != Status::pass)
+            r.value = bd ? juce::String ("breakdown") : onDrop ? juce::String ("drop")
+                         : "bars " + juce::String (firstBar) + dash + juce::String (lastBar);
+            juce::ignoreUnused (onBreakdown);
+            if (r.st != Status::pass && bd)
+            {
+                const int d0 = in.dropBar + 1, d1 = in.dropBar + in.windowBars;
+                auto c = newCard (CheckId::section, "COMPARING AGAINST THE BREAKDOWN", "almost no sub in this section");
+                c.see = R + "'s bars " + juce::String (firstBar) + dash + juce::String (lastBar)
+                        + " are a breakdown: the sub is " + absDb (in.ref.shakeDb()) + " down in the mix. If your loop is your drop, "
+                          "compare it with " + R + "'s drop (bars " + juce::String (d0) + dash + juce::String (d1) + ") instead. "
+                          "The other fixes wait until this one is sorted.";
+                c.cause = "Breakdowns and drops need different advice: a breakdown is meant to lose its sub.";
+                c.how.add ("Your loop is a drop: press FIND THE DROP.");
+                c.how.add ("Your loop is your breakdown: press IT'S MY BREAKDOWN, and the cards switch to breakdown advice.");
+                c.worked = "Comparing to reads \"drop\" or \"breakdown\".";
+                c.offerFindDrop = c.offerDismiss = true;
+                c.dismissLabel = "IT'S MY BREAKDOWN";
+                r.hasCard = true;  r.card = c;
+            }
+            else if (r.st != Status::pass)
             {
                 const int d0 = in.dropBar + 1, d1 = in.dropBar + in.windowBars;
                 auto c = newCard (CheckId::section, "COMPARING AGAINST A QUIETER SECTION",
@@ -431,7 +480,82 @@ void Coach::update (const CoachInputs& in, double nowSec)
 
     //--------------------------------------------------------------------------
     // 6. Sub level
-    if (both)
+    if (both && bd)
+    {
+        // Breakdown mode: the reference has (almost) no sub here. Compare loosely, and say HOW the
+        // reference muted its kick and bass, from its band shares.
+        auto& r = raw[(size_t) CheckId::subLevel];
+        const float d = in.you.shakeDb() - in.ref.shakeDb();
+        r.metric = d;
+        r.value = signedDb (d);
+        const bool bothNone = in.you.shakeDb() <= -30.0f && in.ref.shakeDb() <= -25.0f;
+        r.st = (bothNone || std::abs (d) <= 3.0f) ? Status::pass : (std::abs (d) <= 6.0f ? Status::near : Status::fail);
+        if (r.st != Status::pass)
+        {
+            const bool haveBands = in.youM.valid && in.refM.valid;
+            const auto& ys = in.youM.bandDb;
+            const auto& rs = in.refM.bandDb;
+            using B = Measurements::Band;
+            const bool refHP = haveBands && rs[B::bSub] <= -30.0f && rs[B::bBody] - rs[B::bSub] >= 20.0f;
+            const bool youLP = haveBands && ys[B::bHigh] - rs[B::bHigh] <= -6.0f && ys[B::bSub] - rs[B::bSub] >= 10.0f;
+            // how deep the reference's low cut goes: compare its punch zone with its body
+            const juce::String cut = ! haveBands                             ? "about 120-150 Hz"
+                                   : rs[B::bPunch] >= rs[B::bBody] - 10.0f ? "about 60-80 Hz"
+                                   : rs[B::bPunch] >= rs[B::bBody] - 15.0f ? "about 120-150 Hz"
+                                                                           : "about 150-200 Hz";
+            auto bandText = [] (float v) { return juce::String (juce::roundToInt (v)) + " dB"; };
+            FixCard c;
+            if (d > 0)
+            {
+                if (youLP && refHP)
+                {
+                    c = newCard (CheckId::subLevel, "YOU'RE LOW-PASSING; THE REFERENCE HIGH-PASSES", signedDb (d) + " sub vs " + R + "'s breakdown");
+                    c.see = R + "'s breakdown keeps almost no sub (20-60 Hz: " + bandText (rs[B::bSub]) + " of the mix) and puts its weight at 120-300 Hz ("
+                            + bandText (rs[B::bBody]) + "). Yours keeps its sub (" + bandText (ys[B::bSub]) + ") and loses its highs (2-10 kHz: "
+                            + bandText (ys[B::bHigh]) + " vs " + bandText (rs[B::bHigh]) + "): that's a low-pass. The more you close a low-pass, "
+                              "the more of what's left is sub, so this reading goes up.";
+                    c.cause = "A low-pass muffles by removing the top, which leaves the sub in charge. " + R + " mutes the other way: it removes the bottom.";
+                    c.how.add ("On the kick and the rolling bass, swap the low-pass for a high-pass: EQ Eight low cut, 24 dB/oct, at " + cut + ".");
+                    c.how.add ("Want some muffle as well? Add a gentle high cut around 3 kHz, or use Auto Filter in band-pass.");
+                    c.how.add ("Automate the filter off at the drop, so the full sub comes back at once.");
+                    c.how.add ("Turning the fader down won't fix this: the sub's share of the mix stays the same.");
+                }
+                else if (refHP)
+                {
+                    c = newCard (CheckId::subLevel, "YOUR MUTED KICK AND BASS STILL CARRY SUB", signedDb (d) + " sub vs " + R + "'s breakdown");
+                    c.see = R + "'s breakdown keeps almost no sub (20-60 Hz: " + bandText (rs[B::bSub]) + " of the mix) and puts its weight at 120-300 Hz ("
+                            + bandText (rs[B::bBody]) + "). Yours still has sub at " + bandText (ys[B::bSub]) + ".";
+                    c.cause = R + " mutes its kick and bass with a high-pass: the thump stays, the sub goes.";
+                    c.how.add ("High-pass the kick and the rolling bass in the breakdown: EQ Eight low cut, 24 dB/oct, at " + cut + ".");
+                    c.how.add ("Still reading over? Raise the cutoff a little, or use the steeper 48 dB/oct slope.");
+                    c.how.add ("Automate it off at the drop, so the full sub comes back at once.");
+                    c.how.add ("Lowering the fader helps less than a filter: the sub's share of the mix barely changes.");
+                }
+                else
+                {
+                    c = newCard (CheckId::subLevel, "TOO MUCH SUB FOR THE BREAKDOWN", signedDb (d) + " sub vs " + R + "'s breakdown");
+                    c.see = "Your breakdown carries " + absDb (d) + " more sub than " + R + "'s, as a share of the mix."
+                            + whoIsIt (in.you, in.ref, true);
+                    c.cause = R + " pulls its kick and bass back further in this section.";
+                    c.how.add ("Lower the kick and bass in the breakdown about " + absDb (d) + ", or high-pass them (EQ Eight low cut around 100 Hz).");
+                    c.how.add ("Automate it back at the drop.");
+                }
+                c.tooFar = "The breakdown sounds like it has no kick at all: bring the cutoff down a little.";
+            }
+            else
+            {
+                c = newCard (CheckId::subLevel, "THE REFERENCE KEEPS MORE SUB IN ITS BREAKDOWN", signedDb (d) + " sub vs " + R + "'s breakdown");
+                c.see = "Your breakdown has " + absDb (d) + " less sub than " + R + "'s, as a share of the mix." + whoIsIt (in.you, in.ref, false);
+                c.cause = "Your breakdown filter or level takes out more low end than " + R + "'s.";
+                c.how.add ("Open the filter on the kick and bass a little (lower the low-cut frequency), or bring them up about " + absDb (d) + ".");
+                c.tooFar = "The breakdown loses its contrast with the drop: go back halfway.";
+            }
+            c.worked = "Sub level reads within 3 dB of " + R + "'s breakdown.";
+            c.watch = "Check the drop afterwards: the filter must be fully off there.";
+            r.hasCard = true;  r.card = c;
+        }
+    }
+    else if (both)
     {
         auto& r = raw[(size_t) CheckId::subLevel];
         const float d = in.you.shakeDb() - in.ref.shakeDb();
@@ -444,7 +568,8 @@ void Coach::update (const CoachInputs& in, double nowSec)
             if (d > 0)
             {
                 c = newCard (CheckId::subLevel, "SUB TOO LOUD", signedDb (d) + " vs " + R);
-                c.see = "Your sub is " + absDb (d) + " over " + R + "'s across the whole loop, as a share of the mix, so loudness can't fool it.";
+                c.see = "Your sub is " + absDb (d) + " over " + R + "'s across the whole loop, as a share of the mix, so loudness can't fool it."
+                        + whoIsIt (in.you, in.ref, true);
                 c.cause = "The bass or sub layer is turned up too far, or the kick's low end is heavy.";
                 c.how.add ("Bass fader about " + signedDb (-d) + " (or the sub layer, if you have one).");
                 c.how.add ("Or Kickstart 2: raise MIX about 5-10% to duck a little more.");
@@ -453,7 +578,8 @@ void Coach::update (const CoachInputs& in, double nowSec)
             else
             {
                 c = newCard (CheckId::subLevel, "SUB TOO QUIET", signedDb (d) + " vs " + R);
-                c.see = "Your sub is " + absDb (d) + " under " + R + "'s across the whole loop, as a share of the mix, so loudness can't fool it.";
+                c.see = "Your sub is " + absDb (d) + " under " + R + "'s across the whole loop, as a share of the mix, so loudness can't fool it."
+                        + whoIsIt (in.you, in.ref, false);
                 c.cause = "The bass or sub layer is too low, or the duck takes out too much.";
                 c.how.add ("Bass fader about " + signedDb (-d) + " (or the sub layer, if you have one).");
                 c.how.add ("Or Kickstart 2: lower MIX about 5-10% to duck a little less.");
@@ -481,7 +607,17 @@ void Coach::update (const CoachInputs& in, double nowSec)
 
     //--------------------------------------------------------------------------
     // 7. Kick punch (the punch zone)
-    if (both)
+    if (both && bd)
+    {
+        auto& r = raw[(size_t) CheckId::punch];
+        const float d = in.you.punchDb() - in.ref.punchDb();
+        r.metric = d;
+        r.value = signedDb (d);
+        r.st = (std::abs (d) <= 3.0f || (in.you.punchDb() <= -25.0f && in.ref.punchDb() <= -20.0f)) ? Status::pass
+             : (std::abs (d) <= 6.0f ? Status::near : Status::fail);
+        // the Sub level card already explains the filter; no second card
+    }
+    else if (both)
     {
         auto& r = raw[(size_t) CheckId::punch];
         const float d = in.you.punchDb() - in.ref.punchDb();
@@ -646,6 +782,18 @@ void Coach::update (const CoachInputs& in, double nowSec)
         info.push_back (c);
     }
 
+    // Breakdown mode: ducking, kick tuning and limiter-squash advice don't apply to a section
+    // that's meant to have no sub
+    if (bd)
+        for (auto id : { CheckId::tuning, CheckId::kickBass, CheckId::beatShape, CheckId::squash, CheckId::djPlayback })
+        {
+            auto& r = raw[(size_t) id];
+            if (r.st == Status::waiting) continue;
+            r.st = Status::info;
+            r.value = "breakdown";
+            r.hasCard = false;
+        }
+
     //--------------------------------------------------------------------------
     // hold-for-one-loop ticking, progress, rows and cards
     float scoreSum = 0;
@@ -709,6 +857,17 @@ void Coach::update (const CoachInputs& in, double nowSec)
                     if (id == CheckId::tuning) return (v >= 0 ? "+" : "-") + juce::String (std::abs (v), 1) + " st";
                     return signedDb (v);
                 };
+                // how far from the target a reading is, so "moving the wrong way" can be spotted
+                auto badness = [id] (float v)
+                {
+                    if (id == CheckId::mono) return (1.0f - v) * 20.0f;
+                    if (id == CheckId::section) return -v;
+                    if (id == CheckId::squash || id == CheckId::djPlayback) return std::max (0.0f, v);
+                    return std::abs (v);
+                };
+                if (t.hasStart && badness (r.metric) > badness (t.start) + 1.0f)
+                    c.worse = "Getting worse since this card appeared (" + fmt (t.start) + arrow + fmt (r.metric)
+                              + "): undo the last change, or try the other direction.";
                 if ((t.hasStart || useSnap) && std::abs (base - r.metric) >= 0.05f)
                     c.progress = (useSnap ? "snapshot " : juce::String()) + fmt (base) + arrow + fmt (r.metric)
                                  + (shown == Status::holding ? U (" \xe2\x9c\x93 holding for one loop pass") : juce::String());
@@ -738,11 +897,16 @@ void Coach::update (const CoachInputs& in, double nowSec)
                                         [] (const FixCard& c) { return c.id != CheckId::section; }),
                         fixCards.end());
     else
-        for (auto& c : info) fixCards.push_back (c);
+        for (auto& c : info)
+        {
+            // a breakdown loop's loudness and thin low-mids are meant to differ from the track's
+            if (bd && (c.id == CheckId::loudnessGap || c.id == CheckId::thinMud)) continue;
+            fixCards.push_back (c);
+        }
     percent = scored >= 3 ? 100.0f * scoreSum / (float) scored : -1.0f;
 
     // one-line status for the header
-    if (! refOk)          status = "Load a reference track (or drop it here), then play your 8-bar loop.";
+    if (! refOk)          status = "Load a reference track (or drop it here), then play your loop.";
     else if (! youOk)     status = "Play your loop in Ableton. Ground Shake listens after the limiter.";
     else
     {
@@ -758,6 +922,7 @@ void Coach::update (const CoachInputs& in, double nowSec)
             status = anyHolding ? "Looking good: holding each fix for one loop pass before it ticks."
                                 : "Your feet shake like the reference. Locked in.";
         }
+        if (bd && raw[(size_t) CheckId::section].st == Status::pass) status = "Breakdown mode. " + status;
     }
 }
 } // namespace gs

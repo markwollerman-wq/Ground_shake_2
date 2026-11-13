@@ -166,7 +166,9 @@ private:
     juce::Viewport fixViewport;
     juce::TextButton aButton { "A: YOUR MIX" }, bButton { "B: REFERENCE" };
     juce::TextButton loadButton { "LOAD" }, x2Button { "x2" }, halfButton { "/2" },
-                     nudgeLeft { "<" }, nudgeRight { ">" }, dropButton { "FIND THE DROP" };
+                     nudgeLeft { "<" }, nudgeRight { ">" }, dropButton { "FIND THE DROP" },
+                     breakdownButton { "FIND BREAKDOWN" };
+    juce::TextButton bars1 { "1" }, bars2 { "2" }, bars4 { "4" }, bars8 { "8" }, loopButton { "LOOP" };
     juce::Label bpmLabel, bpmTitle, detectedLabel, offsetLabel;
     // controls row
     juce::Slider rangeKnob, toleranceKnob;

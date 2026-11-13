@@ -73,6 +73,14 @@ public:
     double getGridStartSec() const;                              // first bar line incl. nudge
     int getDropBar() const { return dropBar; }
     void findTheDrop();
+    void findTheBreakdown();
+    int getBreakdownBar() const { return breakdownBar; }
+    bool isBreakdownMode() const { return breakdownMode; }
+    int getWindowBars() const { return windowBars; }
+    void setWindowBars (int bars, bool fromLoop = false);   // 1, 2, 4 or 8
+    bool isFollowingLoop() const { return followLoop; }
+    void setFollowLoop (bool on);
+    int getHostLoopBars() const { return hostLoopBars.load(); }
     void dismissSectionWarning() { sectionDismissed = true; updateCoach(); }
 
     const gs::StepProfile& getReferenceProfile() const { return refProfile; }
@@ -136,6 +144,8 @@ private:
     void runLiveAnalysis();
     void updateCoach();
     void pushMatchToAudio();
+    void updateSections();
+    void applyHostLoop();
 
     struct LiveAnalyzer : juce::Thread
     {
@@ -191,6 +201,7 @@ private:
     std::atomic<bool> hostPlaying { false }, listenB { false };
     std::atomic<bool> resetRequested { false };
     std::atomic<float> splitParam { gs::kDefaultSplit };
+    std::atomic<int> loopStepsParam { gs::kLoopSteps }, hostLoopBars { 0 };
     std::atomic<float> ceilingDb { -1.0f };
 
     // match settings for the audio thread
@@ -209,7 +220,8 @@ private:
     gs::Measurements refM;
     int refMeasureGen = 0;
     double bpm = 0.0, gridOffsetSec = 0.0;
-    int windowStartBar = 0, dropBar = 0;
+    int windowStartBar = 0, dropBar = 0, breakdownBar = -1, windowBars = gs::kBars;
+    bool followLoop = true, breakdownMode = false;
     float windowVsDropDb = 0.0f;
     bool sectionDismissed = false;
     float tolerance = 1.0f, split = gs::kDefaultSplit, djRefLevel = -9.0f;

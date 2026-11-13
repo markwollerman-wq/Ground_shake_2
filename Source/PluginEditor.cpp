@@ -480,7 +480,7 @@ void ReferenceView::paint (juce::Graphics& g)
 
     const double bpm = proc.getBpm(), barSec = 240.0 / bpm;
     const int barsAvail = proc.getNumReferenceBars();
-    const int bars = juce::jlimit (1, gs::kBars, barsAvail);
+    const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, barsAvail));
     const double winStart = proc.getGridStartSec() + proc.getWindowStartBar() * barSec;
     const double winEnd = winStart + bars * barSec;
     const float wx0 = xForTime (winStart), wx1 = xForTime (winEnd);
@@ -535,13 +535,31 @@ void ReferenceView::paint (juce::Graphics& g)
     g.drawText ("REFERENCE", head, juce::Justification::centredLeft);
     g.setColour (text);
     g.setFont (juce::FontOptions (13.0f));
-    g.drawText (ref->name, head.withTrimmedLeft (90.0f).withTrimmedRight (240.0f), juce::Justification::centredLeft, true);
+    g.drawText (ref->name, head.withTrimmedLeft (90.0f).withWidth (260.0f), juce::Justification::centredLeft, true);
+    g.setColour (muted);
+    g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+    g.drawText ("BARS", juce::Rectangle<float> (378.0f, head.getY(), 40.0f, head.getHeight()), juce::Justification::centredRight);
     g.setColour (red);
-    g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+    g.setFont (juce::FontOptions (12.5f, juce::Font::bold));
     const int first = proc.getWindowStartBar() + 1;
-    g.drawText (juce::String (bars) + " BARS  (bars " + juce::String (first) + "-" + juce::String (first + bars - 1)
-                    + " of " + juce::String (barsAvail) + ")  - drag to move",
+    const juce::String tag = proc.isBreakdownMode() ? "BREAKDOWN  "
+                           : (proc.getWindowStartBar() == proc.getDropBar() ? "DROP  " : juce::String());
+    g.drawText (tag + "bars " + juce::String (first) + "-" + juce::String (first + bars - 1) + " of " + juce::String (barsAvail)
+                    + "  |  drag to move",
                 head, juce::Justification::centredRight);
+
+    // where the drop and the breakdown are
+    auto marker = [&] (int bar, const juce::String& label, juce::Colour c)
+    {
+        if (bar < 0 || barsAvail <= gs::kBars) return;      // a short clip has no sections to mark
+        const float x = xForTime (proc.getGridStartSec() + bar * barSec);
+        g.setColour (c.withAlpha (0.8f));
+        g.fillRect (x - 1.0f, a.getY(), 2.0f, 8.0f);
+        g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+        g.drawText (label, juce::Rectangle<float> (x + 3.0f, a.getY() + 1.0f, 80.0f, 11.0f), juce::Justification::centredLeft);
+    };
+    marker (proc.getDropBar(), "DROP", yellow);
+    marker (proc.getBreakdownBar(), "BREAKDOWN", blue);
 }
 
 void ReferenceView::mouseDown (const juce::MouseEvent& e)
@@ -550,7 +568,7 @@ void ReferenceView::mouseDown (const juce::MouseEvent& e)
     const double barSec = 240.0 / proc.getBpm();
     const int barUnder = (int) std::floor ((timeForX ((float) e.x) - proc.getGridStartSec()) / barSec);
     const int start = proc.getWindowStartBar();
-    const int bars = juce::jlimit (1, gs::kBars, proc.getNumReferenceBars());
+    const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, proc.getNumReferenceBars()));
     if (barUnder >= start && barUnder < start + bars)
         dragGrabBarOffset = barUnder - start;
     else
@@ -853,6 +871,16 @@ void ChecklistView::paint (juce::Graphics& g)
     g.setColour (pct < 0 ? muted : (pct >= 90 ? green : (pct >= 60 ? yellow : over)));
     g.drawText (pct < 0 ? juce::String ("match: --") : "match: " + juce::String (juce::roundToInt (pct)) + "%", head,
                 juce::Justification::centredRight);
+    if (proc.isBreakdownMode())
+    {
+        auto b = juce::Rectangle<float> (head.getCentreX() - 70.0f, head.getY() + 1.0f, 120.0f, 18.0f);
+        g.setColour (blue.withAlpha (0.15f));
+        g.fillRoundedRectangle (b, 9.0f);
+        g.setColour (blue);
+        g.drawRoundedRectangle (b, 9.0f, 1.0f);
+        g.setFont (font (10.5f, true));
+        g.drawText ("BREAKDOWN MODE", b, juce::Justification::centred);
+    }
 
     auto bar = inner.removeFromTop (12.0f).withSizeKeepingCentre (inner.getWidth(), 6.0f);
     g.setColour (juce::Colour (0xff1a1a20));
@@ -987,6 +1015,7 @@ float FixListView::layoutCard (juce::Graphics* g, const gs::FixCard& c, bool exp
     {
         y += para (g, "", c.see, x, y, w, muted.brighter (0.25f), 11.5f);
         if (c.progress.isNotEmpty()) y += 4.0f + para (g, "Progress:", c.progress, x, y + 4.0f, w, text, 11.5f);
+        if (c.worse.isNotEmpty()) y += 4.0f + para (g, "Careful:", c.worse, x, y + 4.0f, w, over.brighter (0.3f), 11.5f);
         return y + 10.0f - area.getY();
     }
 
@@ -1018,6 +1047,7 @@ float FixListView::layoutCard (juce::Graphics* g, const gs::FixCard& c, bool exp
     if (c.tooFar.isNotEmpty()) y += para (g, "Too far if:", c.tooFar, x, y, w, yellow.brighter (0.3f)) + gap;
     if (c.watch.isNotEmpty())  y += para (g, "Watch:", c.watch, x, y, w, text) + gap;
     if (c.progress.isNotEmpty()) y += para (g, "Progress:", c.progress, x, y, w, text) + gap;
+    if (c.worse.isNotEmpty())    y += para (g, "Careful:", c.worse, x, y, w, over.brighter (0.3f)) + gap;
 
     if (c.offerFindDrop || c.offerDismiss)
     {
@@ -1039,7 +1069,7 @@ float FixListView::layoutCard (juce::Graphics* g, const gs::FixCard& c, bool exp
             bx = br.getRight() + 8.0f;
         };
         if (c.offerFindDrop) button ("FIND THE DROP", 1);
-        if (c.offerDismiss)  button ("THAT'S INTENDED", 2);
+        if (c.offerDismiss)  button (c.dismissLabel, 2);
         y += 34.0f;
     }
     return y + 6.0f - area.getY();
@@ -1102,7 +1132,8 @@ GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
     setLookAndFeel (&lnf);
     for (auto* c : std::initializer_list<juce::Component*> {
              &feet, &grid, &refView, &strip, &checklist, &fixViewport, &aButton, &bButton, &loadButton, &x2Button,
-             &halfButton, &nudgeLeft, &nudgeRight, &dropButton, &bpmLabel, &bpmTitle, &detectedLabel, &offsetLabel,
+             &halfButton, &nudgeLeft, &nudgeRight, &dropButton, &breakdownButton, &bars1, &bars2, &bars4, &bars8,
+             &loopButton, &bpmLabel, &bpmTitle, &detectedLabel, &offsetLabel,
              &rangeKnob, &toleranceKnob, &autoButton, &snapshotButton, &resetButton, &reanalyzeButton, &dj6, &dj9, &dj12,
              &matchButton, &previewButton, &applyButton, &revertButton, &weightButton })
         addAndMakeVisible (c);
@@ -1123,7 +1154,21 @@ GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
     x2Button.onClick = [this] { proc.doubleBpm(); };
     halfButton.onClick = [this] { proc.halveBpm(); };
     dropButton.onClick = [this] { proc.findTheDrop(); };
-    dropButton.setTooltip ("Jump the 8-bar window to the reference's fullest, loudest section");
+    dropButton.setTooltip ("Jump the window to the reference's fullest, loudest section");
+    breakdownButton.onClick = [this] { proc.findTheBreakdown(); };
+    breakdownButton.setTooltip ("Jump the window to the reference's breakdown (the section with the least sub)");
+    int n = 0;
+    for (auto* b : { &bars1, &bars2, &bars4, &bars8 })
+    {
+        const int bars = 1 << n++;
+        b->setClickingTogglesState (true);
+        b->setRadioGroupId (3);
+        b->onClick = [this, b, bars] { if (b->getToggleState()) proc.setWindowBars (bars); };
+        b->setTooltip ("Compare " + juce::String (bars) + (bars == 1 ? " bar" : " bars"));
+    }
+    loopButton.setClickingTogglesState (true);
+    loopButton.onClick = [this] { proc.setFollowLoop (loopButton.getToggleState()); };
+    loopButton.setTooltip ("Follow the length of your Ableton loop (1, 2, 4 or 8 bars)");
     auto nudge = [this] (int dir)
     {
         // click = 10 ms, shift-click = one 16th
@@ -1225,6 +1270,13 @@ void GroundShakeContent::refreshReferenceControls()
                          juce::dontSendNotification);
     for (auto* b : { &x2Button, &halfButton, &nudgeLeft, &nudgeRight, &bButton, &dropButton, &reanalyzeButton })
         b->setEnabled (has);
+    breakdownButton.setEnabled (has && proc.getBreakdownBar() >= 0);
+    const int wb = proc.getWindowBars();
+    bars1.setToggleState (wb == 1, juce::dontSendNotification);
+    bars2.setToggleState (wb == 2, juce::dontSendNotification);
+    bars4.setToggleState (wb == 4, juce::dontSendNotification);
+    bars8.setToggleState (wb == 8, juce::dontSendNotification);
+    loopButton.setToggleState (proc.isFollowingLoop(), juce::dontSendNotification);
     bpmLabel.setEditable (has);
     if (! rangeKnob.isMouseButtonDown())
         rangeKnob.setValue (proc.getSplit(), juce::dontSendNotification);
@@ -1293,7 +1345,7 @@ void GroundShakeContent::paint (juce::Graphics& g)
     g.drawText ("GROUND SHAKE", h.withTrimmedLeft (72.0f).withWidth (300.0f), juce::Justification::centredLeft);
     g.setColour (muted.withAlpha (0.7f));
     g.setFont (font (11.0f));
-    g.drawText ("phase 2", h.withTrimmedLeft (306.0f).withWidth (60.0f), juce::Justification::centredLeft);
+    g.drawText ("phase 2.1", h.withTrimmedLeft (306.0f).withWidth (70.0f), juce::Justification::centredLeft);
     {
         auto st = juce::Rectangle<float> (392.0f, headerR.getY() + 6.0f, 646.0f, headerR.getHeight() - 12.0f);
         g.setColour (juce::Colour (0xff0b0b0e));
@@ -1407,16 +1459,24 @@ void GroundShakeContent::resized()
 
     // controls row under the waveform
     const int y = (int) refR.getBottom() - 44;
-    loadButton.setBounds (32, y, 90, 32);
-    bpmTitle.setBounds (150, y, 40, 32);
-    bpmLabel.setBounds (190, y + 1, 84, 30);
-    detectedLabel.setBounds (280, y, 120, 32);
-    x2Button.setBounds (404, y, 50, 32);
-    halfButton.setBounds (458, y, 50, 32);
-    nudgeLeft.setBounds (540, y, 40, 32);
-    nudgeRight.setBounds (584, y, 40, 32);
-    offsetLabel.setBounds (630, y, 110, 32);
-    dropButton.setBounds (770, y, 170, 32);
+    loadButton.setBounds (32, y, 84, 32);
+    bpmTitle.setBounds (126, y, 38, 32);
+    bpmLabel.setBounds (162, y + 1, 78, 30);
+    detectedLabel.setBounds (244, y, 108, 32);
+    x2Button.setBounds (354, y, 44, 32);
+    halfButton.setBounds (402, y, 44, 32);
+    nudgeLeft.setBounds (452, y, 36, 32);
+    nudgeRight.setBounds (492, y, 36, 32);
+    offsetLabel.setBounds (530, y, 90, 32);
+    dropButton.setBounds (622, y, 150, 32);
+    breakdownButton.setBounds (778, y, 162, 32);
+    // window length, in the reference panel's title row
+    const int ty = (int) refR.getY() + 6;
+    bars1.setBounds (440, ty, 30, 22);
+    bars2.setBounds (474, ty, 30, 22);
+    bars4.setBounds (508, ty, 30, 22);
+    bars8.setBounds (542, ty, 30, 22);
+    loopButton.setBounds (580, ty, 54, 22);
 
     // knobs + buttons row
     rangeKnob.setBounds (28, 728, 76, 76);

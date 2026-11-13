@@ -25,10 +25,10 @@ namespace
     }
 
     // "fullest, loudest" score of an 8-bar window, same as the drop finder
-    float sectionScore (const gs::ReferenceTrack& ref, double bpm, double offset, int bar)
+    float sectionScore (const gs::ReferenceTrack& ref, double bpm, double offset, int bar, int bars)
     {
-        const auto prof = gs::profileForWindow (ref, bpm, offset, bar, gs::kBars);
-        return gs::windowLevelDb (ref, bpm, offset, bar) + 0.25f * prof.shakeDb();
+        const auto prof = gs::profileForWindow (ref, bpm, offset, bar, bars);
+        return gs::windowLevelDb (ref, bpm, offset, bar, bars) + 0.25f * prof.shakeDb();
     }
 }
 
@@ -119,6 +119,7 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
         splitter.prepare (sr, sp);
         meter.reset();
     }
+    meter.setLoopSteps (loopStepsParam.load());
     if (resetRequested.exchange (false))
     {
         meter.reset();
@@ -135,6 +136,11 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
             if (auto b = pos->getBpm()) bpmNow = *b;
             playing = pos->getIsPlaying();
             if (auto p = pos->getPpqPosition()) { ppq = *p; havePpq = true; }
+            int loopBars = 0;
+            if (pos->getIsLooping())
+                if (auto lp = pos->getLoopPoints())
+                    loopBars = (int) std::round ((lp->ppqEnd - lp->ppqStart) / 4.0);   // 4/4: 4 quarter notes a bar
+            hostLoopBars.store (loopBars);
         }
     if (! havePpq) playing = true;                       // standalone: free-running clock
     bpmNow = juce::jlimit (40.0, 300.0, bpmNow);
@@ -229,8 +235,9 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     const bool sameTempo = std::abs (pb->bpm - bpmNow) < 0.5;
     const auto loopPosSamples = [&] (double steps)
     {
-        double s = std::fmod (steps, (double) gs::kLoopSteps);
-        if (s < 0) s += gs::kLoopSteps;
+        const double loop = (double) meter.getLoopSteps();
+        double s = std::fmod (steps, loop);
+        if (s < 0) s += loop;
         return (int) (s / 4.0 * 60.0 / pb->bpm * sr) % juce::jmax (1, wLen);
     };
     if (wantB && ! wasListening)
@@ -274,9 +281,11 @@ void GroundShakeProcessor::runLiveAnalysis()
         p = ringPos;
     }
     const double samplesPerBar = 240.0 / juce::jlimit (40.0, 300.0, p.bpm) * sr;
-    int N = (int) std::min<double> (gs::kBars * samplesPerBar, (double) p.count);
+    int N = (int) std::min<double> (juce::jlimit (1, gs::kBars, loopStepsParam.load() / gs::kStepsPerBar) * samplesPerBar,
+                                    (double) p.count);
     N = juce::jmin (N, ringSize - (int) sr);
-    if (N < (int) (2 * samplesPerBar)) return;
+    if (N < (int) juce::jmin (2.0 * samplesPerBar, (double) loopStepsParam.load() / gs::kStepsPerBar * samplesPerBar)
+        || N < (int) (1.05 * sr)) return;
 
     juce::AudioBuffer<float> buf (2, N);
     int idx = p.write - N;
@@ -326,7 +335,7 @@ float GroundShakeProcessor::getRefSubDbNow() const
     double t = refPosSec.load();                         // where the reference is playing
     if (t < 0)                                           // not playing: follow your loop's step
     {
-        const double steps = std::fmod (hostSteps.load(), (double) gs::kLoopSteps);
+        const double steps = std::fmod (hostSteps.load(), (double) (windowBars * gs::kStepsPerBar));
         t = getGridStartSec() + windowStartBar * 240.0 / bpm + steps / 4.0 * 60.0 / bpm;
     }
     const auto f = (size_t) juce::jmax (0.0, t / hopSec);
@@ -373,7 +382,8 @@ void GroundShakeProcessor::loadReferenceAsync (const juce::File& file)
             resampledRate = hostRate;
             bpm = pendingBpm > 0 ? pendingBpm : ref->detectedBpm;
             gridOffsetSec = pendingOffset;
-            dropBar = gs::findDropBar (*reference, bpm, gridOffsetSec);
+            dropBar = gs::findDropBar (*reference, bpm, gridOffsetSec, windowBars);
+            breakdownBar = gs::findBreakdownBar (*reference, bpm, gridOffsetSec, windowBars);
             // a new track opens on its drop; a re-analyzed or restored one keeps its window
             windowStartBar = pendingStartBar >= 0 ? pendingStartBar : dropBar;
             pendingBpm = 0;  pendingOffset = 0;  pendingStartBar = -1;
@@ -404,7 +414,7 @@ void GroundShakeProcessor::setBpm (double newBpm)
 {
     if (newBpm < 40.0 || newBpm > 300.0) return;
     bpm = std::round (newBpm * 100.0) / 100.0;
-    if (reference) dropBar = gs::findDropBar (*reference, bpm, gridOffsetSec);
+    updateSections();
     rebuildWindow();
     if (onReferenceChanged) onReferenceChanged();
 }
@@ -412,7 +422,7 @@ void GroundShakeProcessor::setBpm (double newBpm)
 void GroundShakeProcessor::nudgeGrid (double seconds)
 {
     gridOffsetSec = juce::jlimit (-2.0, 2.0, gridOffsetSec + seconds);
-    if (reference) dropBar = gs::findDropBar (*reference, bpm, gridOffsetSec);
+    updateSections();
     rebuildWindow();
     if (onReferenceChanged) onReferenceChanged();
 }
@@ -427,8 +437,55 @@ void GroundShakeProcessor::setWindowStartBar (int bar)
 void GroundShakeProcessor::findTheDrop()
 {
     if (reference == nullptr) return;
-    dropBar = gs::findDropBar (*reference, bpm, gridOffsetSec);
+    updateSections();
     setWindowStartBar (dropBar);
+}
+
+void GroundShakeProcessor::findTheBreakdown()
+{
+    if (reference == nullptr) return;
+    updateSections();
+    if (breakdownBar < 0) return;
+    sectionDismissed = true;              // comparing breakdown to breakdown is intended
+    setWindowStartBar (breakdownBar);
+}
+
+void GroundShakeProcessor::updateSections()
+{
+    if (reference == nullptr) return;
+    dropBar = gs::findDropBar (*reference, bpm, gridOffsetSec, windowBars);
+    breakdownBar = gs::findBreakdownBar (*reference, bpm, gridOffsetSec, windowBars);
+}
+
+void GroundShakeProcessor::setWindowBars (int bars, bool fromLoop)
+{
+    int b = 1;
+    for (int c : { 1, 2, 4, 8 }) if (bars >= c) b = c;
+    if (! fromLoop) followLoop = false;
+    if (b == windowBars) { if (onReferenceChanged) onReferenceChanged(); return; }
+    // keep the window over the same music: stay on the drop / breakdown if it was there
+    const bool wasDrop = windowStartBar == dropBar, wasBreak = windowStartBar == breakdownBar;
+    windowBars = b;
+    loopStepsParam.store (b * gs::kStepsPerBar);
+    updateSections();
+    if (wasDrop) windowStartBar = dropBar;
+    else if (wasBreak && breakdownBar >= 0) windowStartBar = breakdownBar;
+    coach.reset();
+    rebuildWindow();
+    if (onReferenceChanged) onReferenceChanged();
+}
+
+void GroundShakeProcessor::setFollowLoop (bool on)
+{
+    followLoop = on;
+    if (on) applyHostLoop();
+    if (onReferenceChanged) onReferenceChanged();
+}
+
+void GroundShakeProcessor::applyHostLoop()
+{
+    const int hb = hostLoopBars.load();
+    if (followLoop && hb >= 1) setWindowBars (juce::jmin (hb, gs::kBars), true);
 }
 
 int GroundShakeProcessor::getNumReferenceBars() const
@@ -445,13 +502,20 @@ void GroundShakeProcessor::rebuildWindow()
 {
     if (reference == nullptr || bpm <= 0) return;
     const int barsAvail = getNumReferenceBars();
-    const int bars = juce::jlimit (1, gs::kBars, barsAvail);
-    windowStartBar = juce::jlimit (0, juce::jmax (0, barsAvail - gs::kBars), windowStartBar);
+    const int bars = juce::jlimit (1, windowBars, barsAvail);
+    windowStartBar = juce::jlimit (0, juce::jmax (0, barsAvail - windowBars), windowStartBar);
     refProfile = gs::profileForWindow (*reference, bpm, gridOffsetSec, windowStartBar, bars);
-    windowVsDropDb = barsAvail > gs::kBars
-                         ? sectionScore (*reference, bpm, gridOffsetSec, windowStartBar)
-                               - sectionScore (*reference, bpm, gridOffsetSec, dropBar)
+    windowVsDropDb = barsAvail > windowBars
+                         ? sectionScore (*reference, bpm, gridOffsetSec, windowStartBar, windowBars)
+                               - sectionScore (*reference, bpm, gridOffsetSec, dropBar, windowBars)
                          : 0.0f;
+    // breakdown mode: this window carries far less sub than the drop (muted / filtered kick and bass)
+    {
+        const float dropShake = barsAvail > windowBars
+                                    ? gs::profileForWindow (*reference, bpm, gridOffsetSec, dropBar, windowBars).shakeDb()
+                                    : refProfile.shakeDb();
+        breakdownMode = refProfile.valid && (refProfile.shakeDb() <= -15.0f || refProfile.shakeDb() <= dropShake - 10.0f);
+    }
     measureReferenceWindow();
 
     if (resampled != nullptr)
@@ -527,7 +591,8 @@ void GroundShakeProcessor::applyAutoRange()
 {
     // Auto: the feel/punch split sits a little above the reference's bass note
     // (an E1 bass at 41 Hz -> split ~60 Hz; a G1 at 49 Hz -> ~71 Hz)
-    if (! rangeAuto || ! refM.valid || refM.bassConf < 5.0f) return;
+    // (not from a breakdown: a muted bass's note isn't where the track's sub lives)
+    if (! rangeAuto || ! refM.valid || refM.bassConf < 5.0f || breakdownMode) return;
     const float target = std::round (juce::jlimit (50.0f, 75.0f, refM.bassHz * 1.45f));
     if (std::abs (target - split) >= 1.5f)
         recomputeReferenceBands (target);
@@ -549,7 +614,7 @@ void GroundShakeProcessor::updateCoach()
     {
         const juce::SpinLock::ScopedLockType sl (profileLock);
         in.you = publishedLive;
-        in.haveYou = publishedHasData && publishedSlots >= 32;   // at least 2 bars heard
+        in.haveYou = publishedHasData && publishedSlots >= juce::jmin (32, windowBars * gs::kStepsPerBar);   // 2 bars (or the whole loop) heard
     }
     in.ref = refProfile;
     in.youM = getLiveMeasurements();
@@ -558,8 +623,10 @@ void GroundShakeProcessor::updateCoach()
     in.refName = reference ? reference->name : juce::String();
     in.windowStartBar = windowStartBar;
     in.numRefBars = getNumReferenceBars();
-    in.windowBars = juce::jlimit (1, gs::kBars, in.numRefBars);
+    in.windowBars = juce::jlimit (1, windowBars, juce::jmax (1, in.numRefBars));
     in.dropBar = dropBar;
+    in.breakdownMode = breakdownMode;
+    in.breakdownBar = breakdownBar;
     in.windowVsDropDb = windowVsDropDb;
     in.sectionDismissed = sectionDismissed;
     in.hostBpm = hostBpm.load();
@@ -680,7 +747,7 @@ void GroundShakeProcessor::timerCallback()
         auto ref = reference;
         auto flag = alive;
         const double barSec = 240.0 / bpm;
-        const int bars = juce::jlimit (1, gs::kBars, getNumReferenceBars());
+        const int bars = juce::jlimit (1, windowBars, juce::jmax (1, getNumReferenceBars()));
         const int start = (int) ((getGridStartSec() + windowStartBar * barSec) * ref->sampleRate);
         const int len = (int) (bars * barSec * ref->sampleRate);
         const float sp = split;
@@ -700,6 +767,12 @@ void GroundShakeProcessor::timerCallback()
         });
     }
 
+    if (followLoop && hostLoopBars.load() >= 1 && juce::jmin (hostLoopBars.load(), gs::kBars) != windowBars)
+    {
+        int b = 1;
+        for (int c : { 1, 2, 4, 8 }) if (juce::jmin (hostLoopBars.load(), gs::kBars) >= c) b = c;
+        if (b != windowBars) applyHostLoop();
+    }
     if (++timerTicks % 3 == 0) updateCoach();
 }
 
@@ -722,6 +795,8 @@ void GroundShakeProcessor::getStateInformation (juce::MemoryBlock& dest)
     xml.setAttribute ("split", split);
     xml.setAttribute ("rangeAuto", rangeAuto);
     xml.setAttribute ("djRef", djRefLevel);
+    xml.setAttribute ("windowBars", windowBars);
+    xml.setAttribute ("followLoop", followLoop);
     xml.setAttribute ("sectionDismissed", sectionDismissed);
     xml.setAttribute ("matchApplied", matchState == MatchState::applied);
     xml.setAttribute ("matchFeel", matchSettings.feelDb);
@@ -742,6 +817,9 @@ void GroundShakeProcessor::setStateInformation (const void* data, int size)
     splitParam.store (split);
     rangeAuto = xml->getBoolAttribute ("rangeAuto", true);
     djRefLevel = (float) xml->getDoubleAttribute ("djRef", -9.0);
+    windowBars = juce::jlimit (1, gs::kBars, xml->getIntAttribute ("windowBars", gs::kBars));
+    loopStepsParam.store (windowBars * gs::kStepsPerBar);
+    followLoop = xml->getBoolAttribute ("followLoop", true);
     sectionDismissed = xml->getBoolAttribute ("sectionDismissed", false);
     matchSettings.feelDb = (float) xml->getDoubleAttribute ("matchFeel", 0.0);
     matchSettings.punchDb = (float) xml->getDoubleAttribute ("matchPunch", 0.0);

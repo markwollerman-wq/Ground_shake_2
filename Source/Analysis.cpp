@@ -249,8 +249,10 @@ void detectTempo (ReferenceTrack& ref)
             if (s > fineScore) { fineScore = s; fineBpm = bpm; fineFrame = ph; }
         }
     }
-    // round to 0.01 BPM; most dance tracks sit on a whole BPM
-    if (std::abs (fineBpm - std::round (fineBpm)) < 0.12) fineBpm = std::round (fineBpm);
+    // round to 0.01 BPM; most dance tracks sit on a whole BPM (short clips get a wider snap,
+    // since a few seconds can't pin the tempo down to a tenth)
+    const double snap = ref.lengthSeconds() < 30.0 ? 0.3 : 0.12;
+    if (std::abs (fineBpm - std::round (fineBpm)) < snap) fineBpm = std::round (fineBpm);
     ref.detectedBpm = std::round (fineBpm * 100.0) / 100.0;
 
     // --- beat PHASE: rolling basses put big low-end onsets BETWEEN the kicks and the sub
@@ -267,6 +269,42 @@ void detectTempo (ReferenceTrack& ref)
             for (double p = ph; p < (double) N - 1; p += per)
                 sc += sampleAt (oKick, p);
             if (sc > bestS) { bestS = sc; bestPh = ph; }
+        }
+        // A muted (high-passed) kick has no click, and then the 1-4 kHz band is just hi-hats on
+        // every 16th: the four 16th positions score about the same. In that case pick the 16th
+        // where the low thump (sub + punch + body) starts.
+        auto scoreAt = [&] (const std::vector<float>& o2, double ph)
+        {
+            double sc = 0;
+            for (double p = ph; p < (double) N - 1; p += per)
+            {
+                float pk = 0;
+                for (int d = -1; d <= 1; ++d) pk = std::max (pk, sampleAt (o2, p + d));
+                sc += pk;
+            }
+            return sc;
+        };
+        std::array<double, 4> cs {};
+        for (int k = 0; k < 4; ++k) cs[(size_t) k] = scoreAt (oKick, bestPh + k * per / 4.0);
+        auto sorted = cs;
+        std::sort (sorted.begin(), sorted.end());
+        if (sorted[3] < 1.35 * sorted[2])
+        {
+            std::vector<float> oBody (N, 0.0f);
+            for (size_t i = 1; i < N; ++i)
+            {
+                const float a = ref.feelEnv[i] + ref.punchEnv[i] + ref.mudEnv[i];
+                const float b = ref.feelEnv[i - 1] + ref.punchEnv[i - 1] + ref.mudEnv[i - 1];
+                oBody[i] = std::max (0.0f, a - b);
+            }
+            int bestK = 0;
+            double bk = -1;
+            for (int k = 0; k < 4; ++k)
+            {
+                const double sc = scoreAt (oBody, bestPh + k * per / 4.0);
+                if (sc > bk) { bk = sc; bestK = k; }
+            }
+            bestPh = std::fmod (bestPh + bestK * per / 4.0, per);
         }
         fineFrame = bestPh;
     }
@@ -374,17 +412,17 @@ float windowLevelDb (const ReferenceTrack& ref, double bpm, double gridOffsetSec
     return powerToDb ((float) (s / (double) (i1 - i0)));
 }
 
-int findDropBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec)
+int findDropBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int bars)
 {
     const int barsAvail = numBarsInReference (ref, bpm, gridOffsetSec);
-    if (barsAvail <= kBars) return 0;
+    if (barsAvail <= bars) return 0;
     std::vector<float> lv;
     float best = -200.0f;
-    for (int b = 0; b + kBars <= barsAvail; ++b)
+    for (int b = 0; b + bars <= barsAvail; ++b)
     {
         // "fullest, loudest": the whole mix level plus how much sub it carries
-        const auto prof = profileForWindow (ref, bpm, gridOffsetSec, b, kBars);
-        const float v = windowLevelDb (ref, bpm, gridOffsetSec, b) + 0.25f * prof.shakeDb();
+        const auto prof = profileForWindow (ref, bpm, gridOffsetSec, b, bars);
+        const float v = windowLevelDb (ref, bpm, gridOffsetSec, b, bars) + 0.25f * prof.shakeDb();
         lv.push_back (v);
         best = std::max (best, v);
     }
@@ -392,6 +430,29 @@ int findDropBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec)
         if (lv[(size_t) b] >= best - 0.2f)
             return b;
     return 0;
+}
+
+int findBreakdownBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int bars)
+{
+    const int barsAvail = numBarsInReference (ref, bpm, gridOffsetSec);
+    if (barsAvail <= bars) return -1;
+    std::vector<float> lv, sh;
+    float loudest = -200.0f, drop = -200.0f;
+    for (int b = 0; b + bars <= barsAvail; ++b)
+    {
+        lv.push_back (windowLevelDb (ref, bpm, gridOffsetSec, b, bars));
+        sh.push_back (profileForWindow (ref, bpm, gridOffsetSec, b, bars).shakeDb());
+        loudest = std::max (loudest, lv.back());
+        drop = std::max (drop, sh.back());
+    }
+    float least = 100.0f;
+    for (size_t i = 0; i < lv.size(); ++i)
+        if (lv[i] >= loudest - 12.0f) least = std::min (least, sh[i]);
+    if (least > drop - 8.0f) return -1;                 // no section with clearly less sub
+    for (size_t i = 0; i < lv.size(); ++i)
+        if (lv[i] >= loudest - 12.0f && sh[i] <= least + 1.0f)
+            return (int) i;
+    return -1;
 }
 
 //==============================================================================
@@ -618,6 +679,8 @@ Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int
         juce::dsp::FFT kfft (kOrder);
         std::vector<float> kb ((size_t) kN * 2);
         std::array<double, 12> chroma {};
+        std::array<double, Measurements::numBands> bands {};
+        double bandTotal = 0;
         const int frames = length / kN;
         const int stride = juce::jmax (1, frames / 48);
         for (int f = 0; f < frames; f += stride)
@@ -629,6 +692,13 @@ Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int
                 kb[(size_t) i] = 0.5f * (L[f * kN + i] + R[f * kN + i]) * w;
             }
             kfft.performFrequencyOnlyForwardTransform (kb.data());
+            for (int i = 1; i < kN / 2; ++i)
+            {
+                const double hz = i * sr / kN, pw = (double) kb[(size_t) i] * kb[(size_t) i];
+                bandTotal += pw;
+                const int b = hz < 20 ? -1 : hz < 60 ? 0 : hz < 120 ? 1 : hz < 300 ? 2 : hz < 2000 ? 3 : hz < 10000 ? 4 : -1;
+                if (b >= 0) bands[(size_t) b] += pw;
+            }
             double tot = 1e-12;
             std::array<double, 12> c {};
             for (int i = 1; i < kN / 2; ++i)
@@ -656,6 +726,8 @@ Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int
             }
             return sxx > 0 ? sxy / std::sqrt (sxx * syy) : 0.0;
         };
+        for (size_t b = 0; b < bands.size(); ++b)
+            m.bandDb[b] = (float) (10.0 * std::log10 (std::max (bands[b], 1e-20) / std::max (bandTotal, 1e-20)));
         if (frames > 0)
         {
             double best = -2, second = -2;
@@ -675,6 +747,16 @@ Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int
 }
 
 //==============================================================================
+void LiveStepMeter::setLoopSteps (int steps)
+{
+    steps = juce::jlimit (kStepsPerBar, kLoopSteps, steps);
+    if (steps != loopSteps)
+    {
+        loopSteps = steps;
+        reset();
+    }
+}
+
 void LiveStepMeter::reset()
 {
     done = {};
@@ -686,7 +768,7 @@ void LiveStepMeter::reset()
 void LiveStepMeter::addSample (double positionInSteps, float feelSq, float punchSq, float mudSq, float fullSq) noexcept
 {
     long whole = (long) std::floor (positionInSteps);
-    int slot = (int) (((whole % kLoopSteps) + kLoopSteps) % kLoopSteps);
+    int slot = (int) (((whole % loopSteps) + loopSteps) % loopSteps);
     if (slot != currentSlot)
     {
         if (currentSlot >= 0 && current.count > 0)
@@ -710,7 +792,7 @@ bool LiveStepMeter::hasData() const
 int LiveStepMeter::slotsFilled() const
 {
     int c = 0;
-    for (auto& s : done) if (s.count > 0 && s.serial + (long) kLoopSteps >= serial) ++c;
+    for (auto& s : done) if (s.count > 0 && s.serial + (long) loopSteps >= serial) ++c;
     return c;
 }
 
@@ -724,7 +806,7 @@ StepProfile LiveStepMeter::profile() const
     for (size_t i = 0; i < done.size(); ++i)
     {
         const auto& s = done[i];
-        if (s.count == 0 || s.serial + (long) kLoopSteps < serial) continue;   // only the last loop pass
+        if (s.count == 0 || s.serial + (long) loopSteps < serial) continue;   // only the last loop pass
         const size_t st = i % (size_t) kStepsPerBar;
         fe[st] += s.feel / s.count;  pu[st] += s.punch / s.count;  mu[st] += s.mud / s.count;  fu[st] += s.full / s.count;
         ++cnt[st];

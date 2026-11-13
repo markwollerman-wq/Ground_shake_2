@@ -43,6 +43,8 @@ struct FixCard
     int beatMask = 0;                     // 16ths within the beat (bits 0-3) to shade in the beat-shape graph
     bool beatGraph = false;
     bool offerFindDrop = false, offerDismiss = false;
+    juce::String dismissLabel = "THAT'S INTENDED";
+    juce::String worse;                   // set when the reading has moved the wrong way since the card appeared
     bool fixFirst = false;
 };
 
@@ -66,6 +68,8 @@ struct CoachInputs
     int windowStartBar = 0, windowBars = kBars, dropBar = 0, numRefBars = 0;
     float windowVsDropDb = 0;             // reference window level minus the drop's (dB)
     bool sectionDismissed = false;
+    bool breakdownMode = false;           // the reference window is a low-sub section (muted kicks / bass)
+    int breakdownBar = -1;
     double hostBpm = 120.0;
     float djRefLevel = -9.0f;             // rekordbox Auto Gain reference level
 };

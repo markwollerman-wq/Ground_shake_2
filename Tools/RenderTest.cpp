@@ -8,9 +8,15 @@
 struct FakeHead : juce::AudioPlayHead
 {
     double bpm = 120, ppq = 0;
+    int loopBars = 0;
     juce::Optional<PositionInfo> getPosition() const override
     {
         PositionInfo p;
+        if (loopBars > 0)
+        {
+            p.setIsLooping (true);
+            p.setLoopPoints (juce::AudioPlayHead::LoopPoints { 0.0, loopBars * 4.0 });
+        }
         p.setBpm (bpm);
         p.setPpqPosition (ppq);
         p.setIsPlaying (true);
@@ -53,12 +59,19 @@ int main (int argc, char* argv[])
     juce::ScopedJuceInitialiser_GUI init;
     bool listen = false, doMatch = false;
     float lowGainDb = 0.0f;
-    int forceWindow = -1;
+    int forceWindow = -1, windowBars = 0, hostLoop = 0;
+    bool findBreak = false;
+    float lowpassHz = 0, highpassHz = 0;
     for (int a = 4; a < argc; ++a)
     {
         const juce::String opt (argv[a]);
         listen = listen || opt == "listenB";
         doMatch = doMatch || opt == "match";
+        if (opt.startsWith ("bars=")) windowBars = opt.fromFirstOccurrenceOf ("=", false, false).getIntValue();
+        if (opt.startsWith ("loop=")) hostLoop = opt.fromFirstOccurrenceOf ("=", false, false).getIntValue();
+        if (opt.startsWith ("lowpass=")) lowpassHz = opt.fromFirstOccurrenceOf ("=", false, false).getFloatValue();
+        if (opt.startsWith ("highpass=")) highpassHz = opt.fromFirstOccurrenceOf ("=", false, false).getFloatValue();
+        findBreak = findBreak || opt == "breakdown";
         if (opt.startsWith ("window=")) forceWindow = opt.fromFirstOccurrenceOf ("=", false, false).getIntValue();
         if (opt.startsWith ("gain=")) lowGainDb = opt.fromFirstOccurrenceOf ("=", false, false).getFloatValue();
     }
@@ -76,11 +89,22 @@ int main (int argc, char* argv[])
             for (int i = 0; i < mix.audio.getNumSamples(); ++i) d[i] = b.process (d[i]);
         }
 
+    // optional: simulate a filtered ("muted") breakdown on your mix, 24 dB/oct
+    if (lowpassHz > 0 || highpassHz > 0)
+        for (int c = 0; c < 2; ++c)
+        {
+            gs::Biquad a, b;
+            if (lowpassHz > 0) { a.setLowPass (mix.sampleRate, lowpassHz); b.setLowPass (mix.sampleRate, lowpassHz); }
+            else               { a.setHighPass (mix.sampleRate, highpassHz); b.setHighPass (mix.sampleRate, highpassHz); }
+            auto* d = mix.audio.getWritePointer (c);
+            for (int i = 0; i < mix.audio.getNumSamples(); ++i) d[i] = b.process (a.process (d[i]));
+        }
+
     GroundShakeProcessor proc;
     const int block = 512;
     proc.setPlayConfigDetails (2, 2, mix.sampleRate, block);
     proc.prepareToPlay (mix.sampleRate, block);
-    FakeHead head;  head.bpm = mix.detectedBpm;
+    FakeHead head;  head.bpm = mix.detectedBpm;  head.loopBars = hostLoop;
     proc.setPlayHead (&head);
 
     proc.loadReferenceAsync (juce::File (juce::String::fromUTF8 (argv[2])));
@@ -88,15 +112,23 @@ int main (int argc, char* argv[])
         juce::MessageManager::getInstance()->runDispatchLoopUntil (20);
     if (! proc.hasReference()) { std::printf ("reference failed: %s\n", proc.getLoadError().toRawUTF8()); return 1; }
     pump (600);                                       // reference window measurement + auto range
+    if (windowBars > 0) { proc.setWindowBars (windowBars); pump (600); }
+    if (findBreak) { proc.findTheBreakdown(); pump (600); }
     if (forceWindow >= 0) { proc.setWindowStartBar (forceWindow); pump (600); }
-    std::printf ("reference: %s  BPM %.2f  bars %d  window bar %d  drop bar %d  split %.0f Hz (%s)\n",
-                 proc.getReference()->name.toRawUTF8(), proc.getBpm(), proc.getNumReferenceBars(),
-                 proc.getWindowStartBar() + 1, proc.getDropBar() + 1, proc.getSplit(), proc.isRangeAuto() ? "auto" : "manual");
+    auto refLine = [&]
+    {
+        std::printf ("reference: %s  BPM %.2f  bars %d  window bar %d (%d bars)  drop bar %d  breakdown bar %d  %s  split %.0f Hz (%s)\n",
+                     proc.getReference()->name.toRawUTF8(), proc.getBpm(), proc.getNumReferenceBars(),
+                     proc.getWindowStartBar() + 1, proc.getWindowBars(), proc.getDropBar() + 1, proc.getBreakdownBar() + 1,
+                     proc.isBreakdownMode() ? "BREAKDOWN MODE" : "drop mode", proc.getSplit(), proc.isRangeAuto() ? "auto" : "manual");
+    };
+    refLine();
     proc.setListenToReference (listen);
 
     // play the mix from its first bar line for 8 bars (or the whole clip), twice
     const int start = (int) (mix.firstDownbeatSec * mix.sampleRate);
-    const int len = juce::jmin (mix.audio.getNumSamples() - start, (int) (8 * 240.0 / mix.detectedBpm * mix.sampleRate));
+    const int loopLenBars = hostLoop > 0 ? hostLoop : proc.getWindowBars();
+    const int len = juce::jmin (mix.audio.getNumSamples() - start, (int) (loopLenBars * 240.0 / mix.detectedBpm * mix.sampleRate));
     juce::AudioBuffer<float> buf (2, block);
     juce::MidiBuffer midi;
     double samplesPlayed = 0;
@@ -110,7 +142,8 @@ int main (int argc, char* argv[])
                 for (int c = 0; c < 2; ++c) buf.copyFrom (c, 0, mix.audio, c, start + pos, block);
                 juce::AudioBuffer<float> in;  in.makeCopyOf (buf);
                 // like Ableton's loop brace: every pass starts on the next 8-bar boundary
-                head.ppq = (loopPass * 32.0) + pos / mix.sampleRate * head.bpm / 60.0;
+                head.ppq = hostLoop > 0 ? pos / mix.sampleRate * head.bpm / 60.0
+                                        : (loopPass * loopLenBars * 4.0) + pos / mix.sampleRate * head.bpm / 60.0;
                 samplesPlayed += block;
                 proc.processBlock (buf, midi);
                 if (inR != nullptr && pass == passes - 1) { const float a = rms (in), b = rms (buf); *inR += a * a; *outR += b * b; }
@@ -124,6 +157,8 @@ int main (int argc, char* argv[])
     };
     float inR = 0, outR = 0, maxDiff = 0;
     play (2, &inR, &outR, listen ? nullptr : &maxDiff);
+    pump (300);                                       // the timer picks up the host loop length
+    if (hostLoop > 0) { refLine(); play (8, nullptr, nullptr, nullptr); }
     std::printf ("level check (pass 2): input RMS %.4f  output RMS %.4f  (%s)\n", std::sqrt (inR), std::sqrt (outR),
                  listen ? "B = reference, should be close to input = level-matched" : "A = untouched, must be equal");
     if (! listen) std::printf ("A pass-through: max sample difference %.9f (must be 0)\n", maxDiff);
@@ -161,6 +196,7 @@ int main (int argc, char* argv[])
             std::printf ("     see: %s\n", c.see.toRawUTF8());
             for (int i = 0; i < c.how.size(); ++i) std::printf ("     %d. %s\n", i + 1, c.how[i].toRawUTF8());
             if (c.progress.isNotEmpty()) std::printf ("     progress: %s\n", c.progress.toRawUTF8());
+            if (c.worse.isNotEmpty()) std::printf ("     CAREFUL: %s\n", c.worse.toRawUTF8());
         }
     };
     report ("after two passes");
@@ -187,7 +223,7 @@ int main (int argc, char* argv[])
     for (int i = 0; i < 40; ++i)
     {
         for (int c = 0; c < 2; ++c) buf.copyFrom (c, 0, mix.audio, c, start + (i * block) % (len - block), block);
-        head.ppq = loopPass * 32.0 + ((i * block) % (len - block)) / mix.sampleRate * head.bpm / 60.0;
+        head.ppq = (hostLoop > 0 ? 0.0 : loopPass * loopLenBars * 4.0) + ((i * block) % (len - block)) / mix.sampleRate * head.bpm / 60.0;
         proc.processBlock (buf, midi);
         juce::MessageManager::getInstance()->runDispatchLoopUntil (17);
     }

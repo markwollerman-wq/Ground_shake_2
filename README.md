@@ -1,4 +1,4 @@
-# WOLLER Ground Shake (Phase 2)
+# WOLLER Ground Shake (Phase 2.1)
 
 A meter for the end of your master chain. It answers one question: **if you were standing on a club floor, how much would your feet feel this sub, and does it match your reference track, every 16th of the way?** Phase 2 adds a coach that tells you what to change, in what order, and how.
 
@@ -10,10 +10,12 @@ A meter for the end of your master chain. It answers one question: **if you were
 |---|---|
 | **Two feet** | Left = your mix, right = the reference. Each shakes with its sub. Your foot's colour shows the match: **green** within the tolerance, **yellow** up to 3 dB off, **blue** well under, **red** well over. |
 | **16th step grid** | Sub energy on each of the 16 steps, you vs reference. ^ / v = a step 3 dB or more above / below. The open fix card lights up its steps; after a SNAPSHOT a white line shows where each step was. |
-| **Reference** | LOAD or drop a WAV, AIFF or MP3. A new reference opens on its **drop**. Drag the 8-bar window anywhere; **FIND THE DROP** jumps back. |
+| **Reference** | LOAD or drop a WAV, AIFF or MP3. A new reference opens on its **drop**. Drag the window anywhere; **FIND THE DROP** and **FIND BREAKDOWN** jump to those sections (marked on the waveform). |
+| **Window length** | **BARS 1 / 2 / 4 / 8**, or **LOOP** to follow the length of your Ableton loop (when Ableton shares it). Your side follows the same length. |
+| **Breakdown mode** | Turns on by itself when the reference window has far less sub than the drop (muted or filtered kicks and bass). Ducking, tuning, squash and DJ advice step aside; the Sub level card says *how* the reference muted its kick and bass (high-pass, low-pass or level) and how to match it, e.g. "You're low-passing; the reference high-passes". |
 | **Tempo** | BPM and downbeat are detected; x2 / /2, typed BPM and < > nudge (Shift = one 16th) fix mistakes. |
 | **Checklist** | 10 live checks with a match %: right section, mono, kick tuning, kick/bass, beat shape, sub level, kick punch, mud, limiter squash, DJ playback. A check ticks only after it holds for one full 8-bar loop pass. |
-| **Fix cards** | One card per problem, in fix order, "Fix this first" on top. Each says what we see, the likely cause, numbered **Kickstart 2** steps with suggested amounts, *worked when*, *too far if*, and progress (start or snapshot -> now). Beat-shape cards draw your beat against the reference's. |
+| **Fix cards** | One card per problem, in fix order, "Fix this first" on top. Sub cards say whether it's the kick 16ths or the roll; a **Careful** line appears if a reading gets worse after a change. Each says what we see, the likely cause, numbered **Kickstart 2** steps with suggested amounts, *worked when*, *too far if*, and progress (start or snapshot -> now). Beat-shape cards draw your beat against the reference's. |
 | **Diagnostics strip** | Mono correlation, kick-16th balance, bass and kick notes plus key, sub crest (limiter squash), mud and clarity, LUFS and rekordbox Auto Gain. |
 | **Range knob** | The feel/punch split. Auto sets it from the reference's bass note; turn it for Manual. |
 | **Tolerance knob** | How strict green is (0.25-3 dB, default 1). |

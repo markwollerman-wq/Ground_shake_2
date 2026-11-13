@@ -103,6 +103,9 @@ struct Measurements
     float subCrestDb = 0;           // sub peaks over sub average (limiter squash lowers it)
     float lufs = -70.0f;            // integrated loudness (BS.1770, gated)
     float peakDb = -100.0f;         // sample peak
+    // share of the whole mix per band (dB): how a sound was filtered
+    enum Band { bSub, bPunch, bBody, bMid, bHigh, numBands };   // 20-60, 60-120, 120-300, 300-2k, 2k-10k Hz
+    std::array<float, numBands> bandDb {};
 };
 
 // start/length in samples; firstBeat = samples from `start` to the first beat; beatLen in samples
@@ -158,8 +161,12 @@ int numBarsInReference (const ReferenceTrack& ref, double bpm, double gridOffset
 // Mean full-band power (dB) of `bars` bars starting at startBar
 float windowLevelDb (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int startBar, int bars = kBars);
 
-// The drop: the earliest 8-bar window within 0.5 dB of the loudest, fullest one (bar index)
-int findDropBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec);
+// The drop: the earliest window within 0.2 dB of the loudest, fullest one (bar index)
+int findDropBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int bars = kBars);
+
+// The breakdown: the window with the least sub among the ones that still have music in them
+// (within 12 dB of the loudest window). Returns -1 if nothing stands out as a breakdown.
+int findBreakdownBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int bars = kBars);
 
 //------------------------------------------------------------------------------
 // Live accumulator for YOUR mix, fed sample by sample with the host's position.
@@ -168,6 +175,8 @@ class LiveStepMeter
 {
 public:
     void reset();
+    void setLoopSteps (int steps);         // 16, 32, 64 or 128 (1, 2, 4 or 8 bars); resets when it changes
+    int getLoopSteps() const { return loopSteps; }
     // positionInSteps = host ppq * 4 (sixteenths since song start)
     void addSample (double positionInSteps, float feelSq, float punchSq, float mudSq, float fullSq) noexcept;
     StepProfile profile() const;           // folded over the bars that have data
@@ -180,5 +189,6 @@ private:
     Slot current;
     int currentSlot = -1;
     long serial = 0;                         // counts finished slots; old ones drop out after one loop
+    int loopSteps = kLoopSteps;
 };
 } // namespace gs
