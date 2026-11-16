@@ -50,7 +50,7 @@ Readings that come from the finished master are estimates: the kick note in part
 | Part | What it does |
 |---|---|
 | **Shared timeline** | The reference and your track sit on one bar ruler at the same bar width, so bars line up all the way across. Where one track has no audio, its lane is greyed out. |
-| **NUDGE < >** | Moves your track one bar left or right (**Shift**: one beat); **0** lines the starts up again. Only the view moves: pairs, corrections and the export stay on your real Ableton bars. Saved with the project. |
+| **NUDGE < >** | Moves your track one 16th left or right (**Shift**: one bar); **0** lines the starts up again. Only the view moves: pairs, corrections and the export stay on your real Ableton bars. Saved with the project. |
 | **Zoom** | Mouse wheel or pinch over the waveforms (Shift+wheel or a sideways swipe scrolls), or **- + FIT**. Zoomed in you see beats and 16ths and the real waveform. |
 | **Guided pairing** | **+ PAIR**: step 1, drag across the part of your track to fix; step 2, drag across the reference bars it should sound like (1, 2, 4 or 8 bars), or click a bar to start there with the current length, or **USE WINDOW**. **CANCEL** or Esc stops. Dragging on an empty part of your track starts at step 2 straight away. |
 | **EDIT** | Re-points the selected pair with the same two steps (**KEEP BARS** skips a step). Moving the reference window or clicking A / B never changes a pair any more. |

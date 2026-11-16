@@ -455,15 +455,15 @@ ArrangementView::ArrangementView (GroundShakeProcessor& p) : proc (p)
         addAndMakeVisible (*b);
     auto nudge = [this] (double dir)
     {
-        const double step = juce::ModifierKeys::currentModifiers.isShiftDown() ? 0.25 : 1.0;   // shift: one beat
+        const double step = juce::ModifierKeys::currentModifiers.isShiftDown() ? 1.0 : 1.0 / 16.0;   // a 16th; shift: a bar
         proc.setAlignOffsetBars (proc.getAlignOffsetBars() + dir * step);
         repaint();
     };
     nudgeL.onClick = [nudge] { nudge (-1.0); };
     nudgeR.onClick = [nudge] { nudge (1.0); };
     nudgeZero.onClick = [this] { proc.setAlignOffsetBars (0.0); repaint(); };
-    nudgeL.setTooltip ("Move your track one bar left (Shift: one beat). Only the view moves: pairs and the export stay on your real bars.");
-    nudgeR.setTooltip ("Move your track one bar right (Shift: one beat). Only the view moves: pairs and the export stay on your real bars.");
+    nudgeL.setTooltip ("Move your track one 16th left (Shift: one bar). Only the view moves: pairs and the export stay on your real bars.");
+    nudgeR.setTooltip ("Move your track one 16th right (Shift: one bar). Only the view moves: pairs and the export stay on your real bars.");
     nudgeZero.setTooltip ("Line your song start up with the reference's first bar again");
     zoomOut.onClick = [this] { zoomBy (1.6, songLane().getCentreX()); };
     zoomIn.onClick = [this] { zoomBy (1.0 / 1.6, songLane().getCentreX()); };
@@ -1012,17 +1012,20 @@ void ArrangementView::paint (juce::Graphics& g)
         g.setColour (muted);
         g.drawText ("NUDGE", juce::Rectangle<float> (16.0f, by, 48.0f, 20.0f), juce::Justification::centredLeft);
         const double off = proc.getAlignOffsetBars();
-        const int whole = (int) std::trunc (off);
-        const int beats = (int) std::round (std::abs (off - whole) * 4.0);
-        juce::String o = std::abs (off) < 0.01 ? juce::String ("lined up at the start")
-                         : "your track " + juce::String (off > 0 ? "+" : "-") + juce::String (std::abs (whole)) + (std::abs (whole) == 1 ? " bar" : " bars")
-                               + (beats > 0 ? " " + juce::String (beats) + (beats == 1 ? " beat" : " beats") : juce::String());
+        const int total = (int) std::round (std::abs (off) * 16.0);            // in 16ths
+        const int whole = total / 16, beats = (total % 16) / 4, sixteenths = total % 4;
+        juce::StringArray parts;
+        if (whole > 0)      parts.add (juce::String (whole) + (whole == 1 ? " bar" : " bars"));
+        if (beats > 0)      parts.add (juce::String (beats) + (beats == 1 ? " beat" : " beats"));
+        if (sixteenths > 0) parts.add (juce::String (sixteenths) + " x 16th");
+        juce::String o = total == 0 ? juce::String ("lined up at the start")
+                         : "your track " + juce::String (off > 0 ? "+" : "-") + parts.joinIntoString (" ");
         g.setColour (std::abs (off) < 0.01 ? muted : text);
         g.setFont (juce::FontOptions (11.0f));
         g.drawText (o, juce::Rectangle<float> (146.0f, by, 190.0f, 20.0f), juce::Justification::centredLeft);
         g.setColour (muted.withAlpha (0.8f));
         g.setFont (juce::FontOptions (10.5f));
-        g.drawText ("Shift: one beat.  Wheel: zoom, Shift+wheel: scroll.  Drag on your track to make a pair.",
+        g.drawText ("Click: one 16th, Shift: one bar.  Wheel: zoom, Shift+wheel: scroll.  Drag on your track to make a pair.",
                     juce::Rectangle<float> (336.0f, by, (float) getWidth() - 336.0f - 150.0f, 20.0f), juce::Justification::centredLeft, true);
     }
     else
