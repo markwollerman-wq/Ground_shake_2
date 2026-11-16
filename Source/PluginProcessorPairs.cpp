@@ -982,7 +982,7 @@ void GroundShakeProcessor::setViewMode (ViewMode m)
 
 void GroundShakeProcessor::setAlignOffsetBars (double bars)
 {
-    alignOffsetBars = juce::jlimit (-512.0, 512.0, std::round (bars * 16.0) / 16.0);   // whole 16ths
+    alignOffsetBars = juce::jlimit (-512.0, 512.0, std::round (bars * 32.0) / 32.0);   // whole 32nd notes
     if (onReferenceChanged) onReferenceChanged();
 }
 

@@ -4,6 +4,7 @@
 #include "../Source/PluginProcessor.h"
 #include "../Source/PluginEditor.h"
 #include <cstdio>
+#include <cstdlib>
 
 struct FakeHead : juce::AudioPlayHead
 {
@@ -128,12 +129,55 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
 
     proc.startLearn();
     pump (100);
+    if (std::getenv ("GS_RANDSTART") != nullptr)
+    {
+        // start playback at an odd point (bar 12 and a bit), like pressing play anywhere
+        const double startPpq = 32.0 + 3 * 4.0 + 1.37;
+        const int startSample = (int) ((startPpq - 32.0) / (bpm / 60.0) * sr);
+        for (int pos = startSample; pos + block <= song.getNumSamples(); pos += block)
+        {
+            for (int c = 0; c < 2; ++c) for (int i = 0; i < block; ++i) buf.setSample (c, i, song.getSample (c, pos + i));
+            head.ppq = 32.0 + pos / sr * bpm / 60.0;
+            proc.processBlock (buf, midi);
+            if ((pos / block) % 200 == 0) pump (30);
+        }
+        // then from the start, like playing it again
+    }
     playSong (false, nullptr, nullptr, nullptr);
     pump (200);
     std::printf ("learned waveform bars: %d (status: %s)\n", proc.getLearnedBars(), proc.getLearnMessage().toRawUTF8());
     proc.stopLearn();
     for (int i = 0; i < 300 && ! proc.hasLearnedTrack(); ++i) pump (20);
     std::printf ("learned track: %s, effective start bar %d\n", proc.hasLearnedTrack() ? "yes" : "NO", proc.getEffectiveStartBar());
+    if (auto* lt = proc.getLearnedTrack())
+    {
+        // where does the learned audio sit against the song? (envelope cross-correlation, +-150 ms)
+        const double lr = lt->sampleRate;
+        auto env = [] (const float* x, int n, double rate)        // energy per millisecond, by time
+        {
+            std::vector<float> e;
+            for (int ms = 0;; ++ms)
+            {
+                const int a = (int) (ms * rate / 1000.0), b = (int) ((ms + 1) * rate / 1000.0);
+                if (b > n) break;
+                double v = 0;
+                for (int k = a; k < b; ++k) v += x[k] * x[k];
+                e.push_back ((float) (v / juce::jmax (1, b - a)));
+            }
+            return e;
+        };
+        const int nL = juce::jmin (lt->audio.getNumSamples(), (int) (8 * barSec * lr));
+        auto eL = env (lt->audio.getReadPointer (0), nL, lr);
+        auto eS = env (song.getReadPointer (0), juce::jmin (song.getNumSamples(), (int) (8 * barSec * sr)), sr);
+        int best = 0; double bestV = -1;
+        for (int lag = -150; lag <= 150; ++lag)
+        {
+            double v = 0;
+            for (int i = 200; i + 200 < (int) juce::jmin (eL.size(), eS.size()); ++i) v += eL[(size_t) i] * eS[(size_t) (i - lag)];
+            if (v > bestV) { bestV = v; best = lag; }
+        }
+        std::printf ("learned audio vs song: %d ms late (0 = placed exactly)\n", best);
+    }
     proc.autoPair();
     for (int i = 0; i < 300; ++i)
     {
