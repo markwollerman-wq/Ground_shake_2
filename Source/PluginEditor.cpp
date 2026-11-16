@@ -453,20 +453,32 @@ ArrangementView::ArrangementView (GroundShakeProcessor& p) : proc (p)
     setWantsKeyboardFocus (true);
     for (auto* b : { &nudgeL, &nudgeR, &nudgeZero, &zoomOut, &zoomIn, &zoomFit, &nextButton, &cancelButton, &gridZero })
         addAndMakeVisible (*b);
-    gridZero.onClick = [this] { proc.setSongGridOffsetBars (0.0); refreshButtons(); repaint(); };
+    gridZero.onClick = [this]
+    {
+        const double shiftBefore = std::round (songShift() * 32.0) / 32.0;
+        proc.setSongGridOffsetBars (0.0);
+        proc.setAlignOffsetBars (shiftBefore);              // your bar lines stay put
+        refreshButtons();
+        repaint();
+    };
     gridZero.setTooltip ("Put your track's grid back on Ableton's bar lines");
     auto nudge = [this] (double dir)
     {
         const double step = juce::ModifierKeys::currentModifiers.isShiftDown() ? 1.0 : 1.0 / 32.0;   // a 32nd note; shift: a bar
-        proc.setAlignOffsetBars (proc.getAlignOffsetBars() + dir * step);
+        // move YOUR bar lines in 32nd steps against the reference's, so they always land back on them
+        const double g = proc.getSongGridOffsetBars();
+        // the next step in that direction: from between steps, the first click lands ON the nearest one
+        const double per = 1.0 / step, cur = (proc.getAlignOffsetBars() + g) * per;
+        const double target = (dir < 0 ? std::floor (cur - 1.0e-6) : std::ceil (cur + 1.0e-6)) / per;
+        proc.setAlignOffsetBars (target - g);
         repaint();
     };
     nudgeL.onClick = [nudge] { nudge (-1.0); };
     nudgeR.onClick = [nudge] { nudge (1.0); };
-    nudgeZero.onClick = [this] { proc.setAlignOffsetBars (0.0); repaint(); };
+    nudgeZero.onClick = [this] { proc.setAlignOffsetBars (-proc.getSongGridOffsetBars()); repaint(); };   // your bar 1 under the reference's
     nudgeL.setTooltip ("Move your track a 32nd note left (Shift: one bar). Only the view moves: pairs and the export stay on your real bars.");
     nudgeR.setTooltip ("Move your track a 32nd note right (Shift: one bar). Only the view moves: pairs and the export stay on your real bars.");
-    nudgeZero.setTooltip ("Line your song start up with the reference's first bar again");
+    nudgeZero.setTooltip ("Put your song's first bar line under the reference's first bar line");
     zoomOut.onClick = [this] { zoomBy (1.6, songLane().getCentreX()); };
     zoomIn.onClick = [this] { zoomBy (1.0 / 1.6, songLane().getCentreX()); };
     zoomFit.onClick = [this] { zoomToFit(); };
@@ -1021,7 +1033,7 @@ void ArrangementView::paint (juce::Graphics& g)
         g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
         g.setColour (muted);
         g.drawText ("NUDGE", juce::Rectangle<float> (16.0f, by, 48.0f, 20.0f), juce::Justification::centredLeft);
-        const double off = proc.getAlignOffsetBars();
+        const double off = songShift();                                        // where your bar lines sit
         const int total = (int) std::round (std::abs (off) * 32.0);            // in 32nd notes
         const int whole = total / 32, beats = (total % 32) / 8, rest = total % 8;
         juce::StringArray parts;
@@ -1135,7 +1147,11 @@ void ArrangementView::mouseDoubleClick (const juce::MouseEvent& e)
     drag = Drag::none;
     draftA = draftB = -1;
     const double t = proc.snapToHit (tForX (e.position.x) - proc.getAlignOffsetBars());   // where your audio is, in song bars
+    // keep your bar lines where they were against the reference: the audio slides so the downbeat
+    // you clicked lands on that bar line (bar lines already lined up stay lined up)
+    const double shiftBefore = std::round (songShift() * 32.0) / 32.0;
     proc.setSongGridOffsetBars (t - std::round (t));
+    proc.setAlignOffsetBars (shiftBefore - proc.getSongGridOffsetBars());
     refreshButtons();
     repaint();
 }

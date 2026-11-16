@@ -399,13 +399,16 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
     };
     if (auto* arr = findArr (ed.get()))
     {
-        proc.setAlignOffsetBars (-2.0);
+        proc.setSongGridOffsetBars (0.0622);
+        proc.setAlignOffsetBars (-2.0 - 0.0622 + 0.013);          // bar lines a little off the reference's
         for (auto* ch : arr->getChildren())
             if (auto* b = dynamic_cast<juce::TextButton*> (ch); b != nullptr && b->getButtonText() == "<")
             {
                 for (int k = 0; k < 2; ++k) { b->triggerClick(); for (int i = 0; i < 10; ++i) juce::MessageManager::getInstance()->runDispatchLoopUntil (10); }
             }
-        std::printf ("nudge < twice from -2 bars: offset now %.5f bars (expect -2.0625)\n", proc.getAlignOffsetBars());
+        std::printf ("grid +0.0622, bar lines at %.4f; nudge < twice: your bar lines now at %.5f bars (expect exactly -2.03125: first click lands on -2, the second a 32nd past)\n",
+                     -2.0 + 0.013, proc.getAlignOffsetBars() + proc.getSongGridOffsetBars());
+        proc.setSongGridOffsetBars (0.0);
         shot ("_nudged");
         proc.setAlignOffsetBars (0.0);
         arr->startPairing (-1);

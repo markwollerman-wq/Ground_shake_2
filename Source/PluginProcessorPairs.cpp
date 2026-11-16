@@ -989,7 +989,7 @@ void GroundShakeProcessor::setViewMode (ViewMode m)
 
 void GroundShakeProcessor::setAlignOffsetBars (double bars)
 {
-    alignOffsetBars = juce::jlimit (-512.0, 512.0, std::round (bars * 32.0) / 32.0);   // whole 32nd notes
+    alignOffsetBars = juce::jlimit (-512.0, 512.0, bars);       // the editor keeps your bar lines on 32nd steps
     if (onReferenceChanged) onReferenceChanged();
 }
 
@@ -1332,7 +1332,7 @@ namespace
             c.id = id;  c.severity = sev;  c.title = title;  c.headline = headline;
             c.comparing = comparing;
             c.adviceOnly = true;
-            c.fixed = "Advice for your master chain: put these before your limiter, with Ground Shake last.";
+            c.fixed = "Advice for your master chain, using Ableton's own devices: put these before your limiter, with Ground Shake last.";
             return c;
         };
         auto statusOf = [] (float a, float nearAt, float failAt)
@@ -1372,11 +1372,11 @@ namespace
                     const float g = juce::jlimit (0.5f, 3.0f, half (std::abs (b.d) * 0.6f));
                     const juce::String hz = b.hz >= 1000 ? juce::String (b.hz / 1000.0f, 1) + " kHz" : juce::String ((int) b.hz) + " Hz";
                     if (b.d < 0)
-                        c.how.add ("On your master EQ (e.g. Pro-Q 4), before the limiter: a wide bell (Q 0.5-0.7) +" + juce::String (g, 1)
-                                   + " dB at " + hz + (b.hz >= 4000 ? ", or a gentle high shelf from 3 kHz." : "."));
+                        c.how.add ("Ableton's EQ Eight on your master, before the limiter (or any EQ you like): a Bell, Q about 0.7, +" + juce::String (g, 1)
+                                   + " dB at " + hz + (b.hz >= 4000 ? ". Or a High Shelf from 3 kHz." : "."));
                     else
-                        c.how.add ("On your master EQ, before the limiter: a wide bell -" + juce::String (g, 1) + " dB at " + hz
-                                   + (b.hz >= 4000 ? ". If it's harsh rather than just bright, soothe3 on the master tames it more gently." : "."));
+                        c.how.add ("EQ Eight on your master, before the limiter: a Bell, Q about 0.7, -" + juce::String (g, 1) + " dB at " + hz
+                                   + (b.hz >= 4000 ? ". If it's harsh rather than just bright, find the harsh sound (hats, a lead) and cut it on its own channel instead." : "."));
                 }
                 c.how.add ("Start at about half the gap and listen: EQ on the master moves everything, so small moves go a long way.");
                 c.worked = "This row goes green after you re-learn (or play the drop in Ableton with the MASTER view open).";
@@ -1403,14 +1403,14 @@ namespace
                 if (d < 0)
                 {
                     c.cause = "Less going on in the sides, so the drop feels smaller than the reference on a big system.";
-                    c.how.add ("On your master, before the limiter: a stereo imager (e.g. Ozone 12 Imager) with the bands above 300 Hz widened. Start around +15-20% and compare.");
-                    c.how.add ("Keep the low band (below 120-200 Hz) at 0% or narrower: width goes in the top, never the sub.");
+                    c.how.add ("Ableton's Utility on your master, before the limiter: turn on Bass Mono (120 Hz) first, then raise Width to about 110-120% and compare. Bass Mono keeps the sub in the centre while the rest widens.");
+                    c.how.add ("Width goes in the top, never the sub.");
                     c.how.add ("Better still, widen the sounds that should be wide (pads, chords, FX returns) on their own channels.");
                 }
                 else
                 {
                     c.cause = "More in the sides than the reference. Clubs often play mono or near-mono, and very wide parts can drop out or feel hollow.";
-                    c.how.add ("On your master imager, narrow the bands above 300 Hz a little (-10 to -15%) and compare.");
+                    c.how.add ("Utility on your master: lower Width to about 85-90% and compare.");
                     c.how.add ("Check the drop in mono (Ableton Utility on the master, Width 0%): anything that vanishes is too wide on its own channel.");
                 }
                 c.tooFar = "If the centre (kick, bass, lead) starts to feel weaker, you've widened too much.";
@@ -1431,7 +1431,7 @@ namespace
                 auto c = card (gs::CheckId::masterLowMono, st, "LOW END NOT MONO", "Below 120 Hz your left and right differ (" + juce::String (mc, 2) + "; 1.00 is mono)");
                 c.see = "Correlation of left and right below 120 Hz: " + juce::String (mc, 2) + " (reference " + juce::String (r.monoCorr, 2) + ").";
                 c.cause = "Stereo sub or bass loses power on mono club systems and can cancel itself out.";
-                c.how.add ("On your master: Ozone 12 Imager with the low band (up to 120 Hz) at -100% (mono), or Ozone Low End Focus / Bass Control.");
+                c.how.add ("Ableton's Utility on your master: turn on Bass Mono and set it to 120 Hz. Everything below goes mono, the rest is untouched.");
                 c.how.add ("Find the source: a stereo bass patch (unison, chorus) or reverb on the bass. Make that channel mono below 120 Hz.");
                 c.how.add ("Per section, Ground Shake's MONO button does the same thing in a pair's correction.");
                 c.tooFar = "Mono below 120 Hz can't go too far; just don't push the crossover much above 150-200 Hz.";
@@ -1454,8 +1454,8 @@ namespace
                 c.see = "Crest (peak over RMS) in the drop: you " + juce::String (ys.crestDb, 1) + " dB, reference " + juce::String (rs.crestDb, 1)
                         + " dB. Sub peaks: " + db1 (dSub) + ".";
                 c.cause = "Your limiter (or clipper) is working harder, so the kick has less room to hit. On a club system that reads as smaller, not louder.";
-                c.how.add ("On your limiter (e.g. Pro-L 2): lower the gain by about " + juce::String (juce::jlimit (0.5f, 4.0f, half (-d)), 1) + " dB and compare level-matched.");
-                c.how.add ("Try a cleaner style (Transparent or Modern) and a slightly slower release.");
+                c.how.add ("On your limiter (Ableton's Limiter or whichever you use): lower its Gain by about " + juce::String (juce::jlimit (0.5f, 4.0f, half (-d)), 1) + " dB and compare level-matched.");
+                c.how.add ("If your limiter has a release setting, try it a little slower (or Auto).");
                 if (dSub <= -3.0f)
                     c.how.add ("The sub is losing its peaks: ease the sub into the limiter (a little less sub before it, or a gentle clipper before the limiter) so the limiter isn't driven by the low end.");
                 c.worked = "Crest within 1.5 dB of the reference. rekordbox Auto Gain levels the loudness anyway, so the punch is what's left.";
@@ -1501,9 +1501,9 @@ namespace
         {
             auto c = card (gs::CheckId::masterChain, gs::Status::info, "MASTER CHAIN ORDER", "Where each change goes on your master");
             c.comparing = {};
-            c.how.add ("Master EQ (tone): first.");
-            c.how.add ("Stereo imager (width, low end mono): after the EQ.");
-            c.how.add ("Glue compressor if you use one, then the limiter (e.g. Pro-L 2).");
+            c.how.add ("EQ Eight (tone): first.");
+            c.how.add ("Utility (Width, Bass Mono): after the EQ.");
+            c.how.add ("Glue Compressor if you use one, then your limiter.");
             c.how.add ("Ground Shake last, after the limiter: its corrections and safety ceiling follow your limiter's peak level.");
             c.watch = "Re-learn after changing the master, so the pairs and this check measure the new sound.";
             cards.push_back (c);
