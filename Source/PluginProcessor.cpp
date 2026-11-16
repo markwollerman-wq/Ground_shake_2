@@ -193,7 +193,8 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
             std::copy (wL, wL + n, preL.data());
             std::copy (wR, wR + n, preR.data());
         }
-        matchStage.process (wL, wR, n, target, act, lm, startSteps, stepsPerSample, 60.0 / bpmNow * sr);
+        // beat-synced fixes follow YOUR beats: Ableton's position, moved by your track's grid offset
+        matchStage.process (wL, wR, n, target, act, lm, startSteps - songGridSteps.load(), stepsPerSample, 60.0 / bpmNow * sr);
         ceilingDb.store (matchStage.ceilingDb());
     }
 
@@ -204,6 +205,7 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     const float subCoef = (float) std::exp (-1.0 / (0.03 * sr));     // ~30 ms for the shake
     const double msCoef = std::exp (-1.0 / (3.0 * sr));              // ~3 s for loudness
     const bool ringOk = ringSize > 0 && (int) ringL.size() == ringSize;
+    const double meterSteps = startSteps - songGridSteps.load();     // your beats (grid offset applied)
     for (int i = 0; i < n; ++i)
     {
         const float m = 0.5f * (L[i] + R[i]);
@@ -212,7 +214,7 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
         const float fs = feel * feel, ps = punch * punch, ms = m * m;
         if (playing)
         {
-            meter.addSample (startSteps + i * stepsPerSample, fs, ps, mud * mud, ms);
+            meter.addSample (meterSteps + i * stepsPerSample, fs, ps, mud * mud, ms);
             if (ringOk)
             {
                 ringL[(size_t) ringWriteLocal] = L[i];
@@ -230,7 +232,7 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
         ringCountLocal += n;
         const juce::SpinLock::ScopedTryLockType tl (ringLock);
         if (tl.isLocked())
-            ringPos = { ringWriteLocal, ringCountLocal, endSteps, bpmNow };
+            ringPos = { ringWriteLocal, ringCountLocal, endSteps - songGridSteps.load(), bpmNow };
     }
 
     liveSubDb.store (gs::powerToDb (subPow / (float) juce::jmax (1.0e-9, mixMeanSquare)));

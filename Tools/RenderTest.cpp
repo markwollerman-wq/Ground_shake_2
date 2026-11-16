@@ -91,6 +91,7 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
 
     juce::MidiBuffer midi;
     juce::AudioBuffer<float> buf (2, block);
+    const int delaySamples = std::getenv ("GS_DELAYMS") != nullptr ? (int) (std::atof (std::getenv ("GS_DELAYMS")) * sr / 1000.0) : 0;
     auto playSong = [&] (bool checkUntouched, double* maxDiffIn, double* maxDiffOut, int* blocksIn)
     {
         // two bars of lead-in before bar 9, then the song
@@ -101,7 +102,7 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
             for (int c = 0; c < 2; ++c)
                 for (int i = 0; i < block; ++i)
                 {
-                    const int sidx = pos + i - lead;
+                    const int sidx = pos + i - lead - delaySamples;      // GS_DELAYMS: the track sits late on Ableton's grid
                     buf.setSample (c, i, sidx >= 0 && sidx < song.getNumSamples() ? song.getSample (c, sidx) : 0.01f * std::sin (i * 0.05f));
                 }
             juce::AudioBuffer<float> in;  in.makeCopyOf (buf);
@@ -205,6 +206,26 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
             if (r.status != gs::Status::pass) std::printf ("    [%s] %s %s\n", statusName (r.status), r.name.toRawUTF8(), r.value.toRawUTF8());
         for (auto& c : p.coach.cards())
             std::printf ("    card: %s%s  (%s)\n", c.fixFirst ? "FIX FIRST " : "", c.title.toRawUTF8(), c.headline.toRawUTF8());
+    }
+
+    {
+        const auto& p0 = proc.getPairs()[0];
+        const auto bs = gs::beatShape (p0.you, p0.ref);
+        std::printf ("\nGRID before: pair 1 light %d, kick 16th %+.2f, 2nd %+.2f, 4th %+.2f, kick riseMs %.1f\n", p0.status, bs.diff[0], bs.diff[1], bs.diff[3], p0.youM.kick.riseMs);
+    }
+    if (delaySamples > 0)
+    {
+        // what double-clicking the first kick of bar 4 does
+        const double clickBar = 4.0 + delaySamples / sr / barSec * 0.7;
+        const double t = proc.snapToHit (clickBar);
+        proc.setSongGridOffsetBars (t - std::round (t));
+        std::printf ("double-click near bar 4 (+%.0f ms): snapped to +%.1f ms; grid offset %.4f bars = %.1f ms (delay was %.1f ms)\n",
+                     (clickBar - 4.0) * barSec * 1000.0, (t - 4.0) * barSec * 1000.0, proc.getSongGridOffsetBars(), proc.songGridSec() * 1000.0,
+                     delaySamples / sr * 1000.0);
+        pump (4000);                       // the pairs are re-measured one by one
+        const auto& p0 = proc.getPairs()[0];
+        const auto bs = gs::beatShape (p0.you, p0.ref);
+        std::printf ("GRID after:  pair 1 light %d, kick 16th %+.2f, 2nd %+.2f, 4th %+.2f, kick riseMs %.1f\n", p0.status, bs.diff[0], bs.diff[1], bs.diff[3], p0.youM.kick.riseMs);
     }
 
     proc.matchAllPairs();
@@ -378,6 +399,14 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
     };
     if (auto* arr = findArr (ed.get()))
     {
+        proc.setAlignOffsetBars (-2.0);
+        for (auto* ch : arr->getChildren())
+            if (auto* b = dynamic_cast<juce::TextButton*> (ch); b != nullptr && b->getButtonText() == "<")
+            {
+                for (int k = 0; k < 2; ++k) { b->triggerClick(); for (int i = 0; i < 10; ++i) juce::MessageManager::getInstance()->runDispatchLoopUntil (10); }
+            }
+        std::printf ("nudge < twice from -2 bars: offset now %.5f bars (expect -2.0625)\n", proc.getAlignOffsetBars());
+        shot ("_nudged");
         proc.setAlignOffsetBars (0.0);
         arr->startPairing (-1);
         shot ("_pairing");

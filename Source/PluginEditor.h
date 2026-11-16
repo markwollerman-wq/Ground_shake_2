@@ -82,6 +82,7 @@ public:
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
     void mouseMove (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
     void mouseMagnify (const juce::MouseEvent&, float scale) override;
     bool keyPressed (const juce::KeyPress&) override;
@@ -112,8 +113,10 @@ private:
     float xForT (double t) const;
     double tForX (float x) const;
     float xForTime (double sec) const { return xForT ((sec - proc.getGridStartSec()) / refBarSec()); }
-    float xForBar (double songBar) const { return xForT (songBar + proc.getAlignOffsetBars()); }
-    double barForX (float x) const { return tForX (x) - proc.getAlignOffsetBars(); }
+    // your bars follow your track's own grid (set by double-clicking a downbeat)
+    double songShift() const { return proc.getAlignOffsetBars() + proc.getSongGridOffsetBars(); }
+    float xForBar (double songBar) const { return xForT (songBar + songShift()); }
+    double barForX (float x) const { return tForX (x) - songShift(); }
     int refBarForX (float x) const { return (int) std::floor (tForX (x)); }
     int pairAt (float x, int& edge) const;            // edge: -1 start, +1 end, 0 inside
     void drawLaneWave (juce::Graphics&, juce::Rectangle<float> lane, bool reference, float x0, float x1, juce::Colour inside, juce::Colour outside);
@@ -132,7 +135,8 @@ private:
     Step step = Step::none;
     int editIndex = -1;
     juce::TextButton nudgeL { "<" }, nudgeR { ">" }, nudgeZero { "0" }, zoomOut { "-" }, zoomIn { "+" }, zoomFit { "FIT" },
-                     nextButton { "NEXT" }, cancelButton { "CANCEL" };
+                     nextButton { "NEXT" }, cancelButton { "CANCEL" },
+                     gridZero { "GRID 0" };
 };
 
 //==============================================================================

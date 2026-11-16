@@ -516,7 +516,8 @@ void GroundShakeProcessor::autoPair()
     if (reference == nullptr)    { learnMessage = "Load a reference first."; if (onReferenceChanged) onReferenceChanged(); return; }
     const auto& t = *learnedTrack;
     const double lb = learnBpm;
-    const int bars = juce::jmin (learnedBars, gs::numBarsInReference (t, lb, 0.0));
+    const double go = songGridSec();
+    const int bars = juce::jmin (learnedBars, gs::numBarsInReference (t, lb, go));
     constexpr int block = 4;
     // brightness (the 1-4 kHz band against the whole mix) tells a low-passed breakdown from a drop:
     // a low-pass keeps the sub, so sub and level alone would call it a drop
@@ -526,9 +527,9 @@ void GroundShakeProcessor::autoPair()
     for (int b = 0; b + block <= bars; b += block)
     {
         Blk k;
-        k.level = gs::windowLevelDb (t, lb, 0.0, b, block);
-        k.shake = gs::profileForWindow (t, lb, 0.0, b, block).shakeDb();
-        k.bright = gs::windowEnvDb (t, t.clickEnv, lb, 0.0, b, block) - k.level;
+        k.level = gs::windowLevelDb (t, lb, go, b, block);
+        k.shake = gs::profileForWindow (t, lb, go, b, block).shakeDb();
+        k.bright = gs::windowEnvDb (t, t.clickEnv, lb, go, b, block) - k.level;
         maxLevel = std::max (maxLevel, k.level);
         blks.push_back (k);
     }
@@ -618,10 +619,10 @@ void GroundShakeProcessor::analyzePair (int index)
     if (rt == nullptr) return;
     ++pairAnalysisRunning;
     auto flag = alive;
-    const double lb = learnBpm, rb = slotBpm (p.slot), ro = slotOffset (p.slot);
+    const double lb = learnBpm, rb = slotBpm (p.slot), ro = slotOffset (p.slot), go = songGridSec();
     const Pair spec = p;
     const float sp = split;
-    pool.addJob ([this, flag, lt, rt, lb, rb, ro, spec, sp, index]
+    pool.addJob ([this, flag, lt, rt, lb, rb, ro, go, spec, sp, index]
     {
         // the fix is measured from the fullest bars inside A-B
         const int nb = juce::jmax (1, juce::jmin (spec.refBars, spec.songEnd - spec.songStart));
@@ -629,12 +630,13 @@ void GroundShakeProcessor::analyzePair (int index)
         float bestScore = -1.0e9f;
         for (int b = spec.songStart; b + nb <= spec.songEnd; ++b)
         {
-            const float sc = gs::windowLevelDb (*lt, lb, 0.0, b, nb) + 0.25f * gs::profileForWindow (*lt, lb, 0.0, b, nb).shakeDb();
+            const float sc = gs::windowLevelDb (*lt, lb, go, b, nb) + 0.25f * gs::profileForWindow (*lt, lb, go, b, nb).shakeDb();
             if (sc > bestScore) { bestScore = sc; best = b; }
         }
         const double lsr = lt->sampleRate, barL = 240.0 / lb;
-        auto youP = gs::profileForWindow (*lt, lb, 0.0, best, nb);
-        auto youM = gs::measureAudio (lt->audio, (int) (best * barL * lsr), (int) (nb * barL * lsr), lsr, 0.0, barL / 4.0 * lsr, sp);
+        auto youP = gs::profileForWindow (*lt, lb, go, best, nb);
+        const int ys0 = juce::jmax (0, (int) ((best * barL + go) * lsr));
+        auto youM = gs::measureAudio (lt->audio, ys0, (int) (nb * barL * lsr), lsr, 0.0, barL / 4.0 * lsr, sp);
 
         const double rsr = rt->sampleRate, barR = 240.0 / rb;
         auto refP = gs::profileForWindow (*rt, rb, ro, spec.refStart, spec.refBars);
@@ -740,17 +742,19 @@ void GroundShakeProcessor::simulatePair (int index)
     corr.split = split;
     const float sp = split;
     const bool tune = p.corrAuto;
-    pool.addJob ([this, flag, lt, lb, spec, corr, sp, index, tune]
+    const double go = songGridSec();
+    pool.addJob ([this, flag, lt, lb, spec, corr, sp, index, tune, go]
     {
         const double lsr = lt->sampleRate, barSec = 240.0 / lb;
         const int nb = juce::jmax (1, juce::jmin (spec.refBars, spec.songEnd - spec.songStart));
         const int pre = spec.measureStart >= 1 ? 1 : 0;                    // a bar to settle the filters
-        const int s0 = (int) std::round ((spec.measureStart - pre) * barSec * lsr);
-        const int len = juce::jmin ((int) std::round ((nb + pre) * barSec * lsr), lt->audio.getNumSamples() - s0);
+        // the slice starts on one of YOUR bar lines (grid offset applied); before the recording = silence
+        const int s0 = (int) std::round (((spec.measureStart - pre) * barSec + go) * lsr);
+        const int len = juce::jmin ((int) std::round ((nb + pre) * barSec * lsr), lt->audio.getNumSamples() - juce::jmax (0, s0));
         gs::StepProfile outP;
         gs::Measurements outM;
         gs::MatchSettings c = corr;
-        if (s0 >= 0 && len > (int) (barSec * lsr * 0.5))
+        if (len > (int) (barSec * lsr * 0.5))
         {
             gs::ReferenceTrack t;
             t.sampleRate = lsr;
@@ -759,8 +763,11 @@ void GroundShakeProcessor::simulatePair (int index)
             auto run = [&] (const gs::MatchSettings& cs)
             {
                 t.audio.setSize (2, len, false, false, true);
+                t.audio.clear();
+                const int pad = juce::jmax (0, -s0);
                 for (int ch = 0; ch < 2; ++ch)
-                    t.audio.copyFrom (ch, 0, lt->audio, juce::jmin (ch, lt->audio.getNumChannels() - 1), s0, len);
+                    if (len > pad)
+                        t.audio.copyFrom (ch, pad, lt->audio, juce::jmin (ch, lt->audio.getNumChannels() - 1), s0 + pad, len - pad);
                 gs::MatchStage stage;
                 stage.prepare (lsr);
                 const double stepsPerSample = lb / 60.0 * 4.0 / lsr;
@@ -986,6 +993,58 @@ void GroundShakeProcessor::setAlignOffsetBars (double bars)
     if (onReferenceChanged) onReferenceChanged();
 }
 
+void GroundShakeProcessor::setSongGridOffsetBars (double bars)
+{
+    bars = juce::jlimit (-0.5, 0.5, bars);
+    if (std::abs (bars - songGridOffsetBars) < 1.0e-6) return;
+    songGridOffsetBars = bars;
+    songGridSteps.store (bars * gs::kStepsPerBar);
+    resetRequested.store (true);                       // live readings start fresh on the new grid
+    // everything measured on your track moves with the grid
+    pairsToAnalyze.clear();
+    pairsToSimulate.clear();
+    for (int i = 0; i < (int) pairs.size(); ++i) pairsToAnalyze.push_back (i);
+    masterValid = false;
+    masterPending = learnedTrack != nullptr && reference != nullptr;
+    const double ms = songGridSec() * 1000.0;
+    learnMessage = std::abs (bars) < 1.0e-6 ? juce::String ("Your track's grid is back on Ableton's bar lines.")
+                 : "Your track's grid moved " + juce::String (ms >= 0 ? "+" : "") + juce::String (juce::roundToInt (ms))
+                       + " ms: its bar lines now sit on your downbeats." + (pairs.empty() ? juce::String() : juce::String (" Re-measuring your pairs..."));
+    if (onReferenceChanged) onReferenceChanged();
+}
+
+double GroundShakeProcessor::snapToHit (double songBar) const
+{
+    auto lt = learnedTrack;
+    if (lt == nullptr || learnBpm <= 0) return songBar;
+    const double lsr = lt->sampleRate, barSec = 240.0 / learnBpm;
+    const int centre = (int) std::round (songBar * barSec * lsr);
+    const int frame = juce::jmax (1, (int) (0.002 * lsr));                  // 2 ms frames
+    const int reach = (int) (0.040 * lsr);                                   // look 40 ms either side
+    const auto& a = lt->audio;
+    const int n = a.getNumSamples();
+    auto energy = [&] (int s)
+    {
+        double e = 0;
+        for (int k = 0; k < frame; ++k)
+        {
+            const int i = s + k;
+            if (i < 0 || i >= n) continue;
+            const float m = 0.5f * (a.getSample (0, i) + a.getSample (juce::jmin (1, a.getNumChannels() - 1), i));
+            e += m * m;
+        }
+        return e / frame + 1.0e-10;
+    };
+    int best = centre;
+    double bestRise = 0.0;
+    for (int s = centre - reach; s <= centre + reach; s += frame / 2)
+    {
+        const double rise = energy (s) / (energy (s - 2 * frame) + energy (s - frame) + 1.0e-10);
+        if (rise > bestRise) { bestRise = rise; best = s; }
+    }
+    return bestRise > 3.0 ? best / (barSec * lsr) : songBar;                // no clear hit: keep the click
+}
+
 const gs::Coach& GroundShakeProcessor::getDisplayCoach() const
 {
     if (viewMode == ViewMode::master) return masterCoach;
@@ -1109,6 +1168,7 @@ void GroundShakeProcessor::savePhase3 (juce::XmlElement& xml) const
     xml.setAttribute ("selectedPair", selectedPair);
     xml.setAttribute ("followPlayhead", followPlayhead);
     xml.setAttribute ("alignOffsetBars", alignOffsetBars);
+    xml.setAttribute ("songGridOffsetBars", songGridOffsetBars);
     xml.setAttribute ("viewMode", (int) viewMode);
     if (! ovMin.empty())
     {
@@ -1175,6 +1235,8 @@ void GroundShakeProcessor::loadPhase3 (const juce::XmlElement& xml)
     learnOriginPpq.store ((originBar - 1) * 4.0);
     followPlayhead = xml.getBoolAttribute ("followPlayhead", true);
     alignOffsetBars = xml.getDoubleAttribute ("alignOffsetBars", 0.0);
+    songGridOffsetBars = juce::jlimit (-0.5, 0.5, xml.getDoubleAttribute ("songGridOffsetBars", 0.0));
+    songGridSteps.store (songGridOffsetBars * gs::kStepsPerBar);
     viewMode = (ViewMode) juce::jlimit (0, 2, xml.getIntAttribute ("viewMode", (int) ViewMode::out));
     const int wantSlot = juce::jlimit (0, 1, xml.getIntAttribute ("activeSlot", 0));
     activeSlot = wantSlot;
@@ -1477,13 +1539,14 @@ void GroundShakeProcessor::runMasterCheck()
     const double lb = learnBpm, rb = bpm, ro = gridOffsetSec;
     const float sp = split;
     const int startBar = getEffectiveStartBar();
-    pool.addJob ([this, flag, lt, rt, lb, rb, ro, sp, startBar]
+    const double go = songGridSec();
+    pool.addJob ([this, flag, lt, rt, lb, rb, ro, sp, startBar, go]
     {
         const double lsr = lt->sampleRate, barL = 240.0 / lb, barR = 240.0 / rb;
-        const int bars = juce::jlimit (1, gs::kBars, gs::numBarsInReference (*lt, lb, 0.0));
-        const int yDrop = gs::findDropBar (*lt, lb, 0.0, bars);
+        const int bars = juce::jlimit (1, gs::kBars, gs::numBarsInReference (*lt, lb, go));
+        const int yDrop = gs::findDropBar (*lt, lb, go, bars);
         const int rDrop = gs::findDropBar (*rt, rb, ro, bars);
-        const int ys0 = (int) (yDrop * barL * lsr), yn = (int) (bars * barL * lsr);
+        const int ys0 = juce::jmax (0, (int) ((yDrop * barL + go) * lsr)), yn = (int) (bars * barL * lsr);
         auto yM = gs::measureAudio (lt->audio, ys0, yn, lsr, 0.0, barL / 4.0 * lsr, sp);
         auto yS = measureSpread (lt->audio, ys0, yn, lsr);
         const auto w = windowAtRate (*rt, (int) ((rt->firstDownbeatSec + ro + rDrop * barR) * rt->sampleRate),

@@ -451,8 +451,10 @@ juce::Colour ArrangementView::pairColour (int index)
 ArrangementView::ArrangementView (GroundShakeProcessor& p) : proc (p)
 {
     setWantsKeyboardFocus (true);
-    for (auto* b : { &nudgeL, &nudgeR, &nudgeZero, &zoomOut, &zoomIn, &zoomFit, &nextButton, &cancelButton })
+    for (auto* b : { &nudgeL, &nudgeR, &nudgeZero, &zoomOut, &zoomIn, &zoomFit, &nextButton, &cancelButton, &gridZero })
         addAndMakeVisible (*b);
+    gridZero.onClick = [this] { proc.setSongGridOffsetBars (0.0); refreshButtons(); repaint(); };
+    gridZero.setTooltip ("Put your track's grid back on Ableton's bar lines");
     auto nudge = [this] (double dir)
     {
         const double step = juce::ModifierKeys::currentModifiers.isShiftDown() ? 1.0 : 1.0 / 32.0;   // a 32nd note; shift: a bar
@@ -505,6 +507,7 @@ void ArrangementView::resized()
     nudgeL.setBounds (66, y, 24, 20);
     nudgeR.setBounds (92, y, 24, 20);
     nudgeZero.setBounds (118, y, 22, 20);
+    gridZero.setBounds (420, y, 56, 20);
     nextButton.setBounds (560, y, 96, 20);
     cancelButton.setBounds (660, y, 76, 20);
     zoomOut.setBounds (getWidth() - 136, y, 24, 20);
@@ -516,6 +519,7 @@ void ArrangementView::refreshButtons()
 {
     const bool pairing = step != Step::none;
     for (auto* b : { &nudgeL, &nudgeR, &nudgeZero }) b->setVisible (! pairing);
+    gridZero.setVisible (! pairing && std::abs (proc.getSongGridOffsetBars()) > 1.0e-6);
     nextButton.setVisible (pairing);
     cancelButton.setVisible (pairing);
     const bool editing = editIndex >= 0;
@@ -760,33 +764,39 @@ void ArrangementView::paint (juce::Graphics& g)
     drawLaneBack (a, refT0(), refT1(), ref != nullptr && ! proc.isLoading());
     drawLaneBack (s, songT0(), songT0() + juce::jmax (1, proc.getLearnedBars()), haveSong);
 
-    // bar grid across both lanes: bars, and beats / 16ths when zoomed in
+    // bar grid: the reference's bars on top, YOUR bars below (your grid offset applied);
+    // beats and 16ths when zoomed in
     {
         int stepBars = 1;
         while (pxPerBar * stepBars < 7.0f) stepBars *= 2;
         const int labelStep = [&] { int l = 1; while (pxPerBar * l < 44.0f) l *= 2; return juce::jmax (l, stepBars); }();
+        auto laneGrid = [&] (juce::Rectangle<float> lane, double shift)
+        {
+            const int b0 = (int) std::floor (vs - shift) - 1, b1 = (int) std::ceil (vs + vb - shift) + 1;
+            for (int b = b0 - (b0 % stepBars + stepBars) % stepBars; b <= b1; b += stepBars)
+            {
+                const float x = xForT (b + shift);
+                if (x < lane.getX() || x > lane.getRight()) continue;
+                const bool strong = b % (labelStep * 4) == 0;
+                g.setColour (juce::Colours::white.withAlpha (strong ? 0.15f : 0.06f));
+                g.drawVerticalLine ((int) x, lane.getY(), lane.getBottom());
+            }
+            if (pxPerBar >= 40.0f)
+            {
+                const int sub = pxPerBar >= 200.0f ? 16 : 4;
+                for (int b = b0; b <= b1; ++b)
+                    for (int k = 1; k < sub; ++k)
+                    {
+                        const float x = xForT (b + shift + k / (double) sub);
+                        if (x < lane.getX() || x > lane.getRight()) continue;
+                        g.setColour (juce::Colours::white.withAlpha (sub == 16 && k % 4 != 0 ? 0.025f : 0.05f));
+                        g.drawVerticalLine ((int) x, lane.getY(), lane.getBottom());
+                    }
+            }
+        };
+        laneGrid (a, 0.0);
+        laneGrid (s, songShift());
         const int b0 = (int) std::floor (vs), b1 = (int) std::ceil (vs + vb);
-        for (int b = b0 - (b0 % stepBars + stepBars) % stepBars; b <= b1; b += stepBars)
-        {
-            const float x = xForT (b);
-            const bool strong = b % (labelStep * 4) == 0;
-            g.setColour (juce::Colours::white.withAlpha (strong ? 0.15f : 0.06f));
-            g.drawVerticalLine ((int) x, a.getY(), a.getBottom());
-            g.drawVerticalLine ((int) x, s.getY(), s.getBottom());
-        }
-        if (pxPerBar >= 40.0f)
-        {
-            const int sub = pxPerBar >= 200.0f ? 16 : 4;
-            for (int b = b0; b <= b1; ++b)
-                for (int k = 1; k < sub; ++k)
-                {
-                    const float x = xForT (b + k / (double) sub);
-                    if (x < s.getX() || x > s.getRight()) continue;
-                    g.setColour (juce::Colours::white.withAlpha (sub == 16 && k % 4 != 0 ? 0.025f : 0.05f));
-                    g.drawVerticalLine ((int) x, a.getY(), a.getBottom());
-                    g.drawVerticalLine ((int) x, s.getY(), s.getBottom());
-                }
-        }
         // bar numbers: the reference's own bars on top, Ableton bars below
         g.setFont (juce::FontOptions (9.5f));
         const int startBar = proc.getEffectiveStartBar();
@@ -798,7 +808,7 @@ void ArrangementView::paint (juce::Graphics& g)
             if (ref != nullptr && b >= (int) std::floor (refT0()) && b < refT1())
                 g.drawText (juce::String (b + 1), juce::Rectangle<float> (x + 2.0f, a.getBottom() - 12.0f, 40.0f, 11.0f), juce::Justification::centredLeft);
         }
-        const double off = proc.getAlignOffsetBars();
+        const double off = songShift();
         for (int sb = (int) std::floor (vs - off) - 1; sb <= (int) std::ceil (vs + vb - off); ++sb)
         {
             if (((sb % labelStep) + labelStep) % labelStep != 0) continue;
@@ -968,7 +978,7 @@ void ArrangementView::paint (juce::Graphics& g)
         if (proc.isHostPlaying() && nowBar >= 0 && nowBar < shown)
         {
             g.setColour (juce::Colours::white.withAlpha (0.85f));
-            g.drawVerticalLine ((int) xForBar (nowBar), s.getY(), s.getBottom());
+            g.drawVerticalLine ((int) xForT (nowBar + proc.getAlignOffsetBars()), s.getY(), s.getBottom());   // where the audio is
         }
     }
     g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
@@ -1023,10 +1033,17 @@ void ArrangementView::paint (juce::Graphics& g)
         g.setColour (std::abs (off) < 0.01 ? muted : text);
         g.setFont (juce::FontOptions (11.0f));
         g.drawText (o, juce::Rectangle<float> (146.0f, by, 190.0f, 20.0f), juce::Justification::centredLeft);
+        const double gms = proc.songGridSec() * 1000.0;
+        const bool gridSet = std::abs (proc.getSongGridOffsetBars()) > 1.0e-6;
+        g.setColour (gridSet ? yellow : muted);
+        g.setFont (juce::FontOptions (11.0f, gridSet));
+        g.drawText (gridSet ? "grid " + juce::String (gms >= 0 ? "+" : "") + juce::String (juce::roundToInt (gms)) + " ms" : juce::String ("grid: Ableton"),
+                    juce::Rectangle<float> (338.0f, by, 80.0f, 20.0f), juce::Justification::centredLeft);
         g.setColour (muted.withAlpha (0.8f));
         g.setFont (juce::FontOptions (10.5f));
-        g.drawText ("Click: a 32nd note, Shift: one bar.  Wheel: zoom, Shift+wheel: scroll.  Drag on your track to make a pair.",
-                    juce::Rectangle<float> (336.0f, by, (float) getWidth() - 336.0f - 150.0f, 20.0f), juce::Justification::centredLeft, true);
+        g.drawFittedText ("Double-click a downbeat on your track to set its grid.  Wheel: zoom.",
+                          juce::Rectangle<float> (484.0f, by, (float) getWidth() - 484.0f - 186.0f, 20.0f).toNearestInt(),
+                          juce::Justification::centredLeft, 1, 0.75f);
     }
     else
     {
@@ -1109,6 +1126,18 @@ void ArrangementView::mouseMove (const juce::MouseEvent& e)
     const bool inSong = songLane().contains (e.position) && step == Step::none;
     const int i = inSong ? pairAt (e.position.x, edge) : -1;
     setMouseCursor (i >= 0 && edge != 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+}
+
+void ArrangementView::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    // like setting the downbeat in rekordbox: the bar line nearest the click moves onto your beat
+    if (step != Step::none || ! songLane().contains (e.position) || ! proc.hasLearnedTrack()) return;
+    drag = Drag::none;
+    draftA = draftB = -1;
+    const double t = proc.snapToHit (tForX (e.position.x) - proc.getAlignOffsetBars());   // where your audio is, in song bars
+    proc.setSongGridOffsetBars (t - std::round (t));
+    refreshButtons();
+    repaint();
 }
 
 void ArrangementView::mouseDown (const juce::MouseEvent& e)

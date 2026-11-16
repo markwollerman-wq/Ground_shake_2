@@ -232,6 +232,14 @@ public:
     void setViewMode (ViewMode m);
     double getAlignOffsetBars() const { return alignOffsetBars; } // where your track sits under the reference (bars)
     void setAlignOffsetBars (double bars);
+    // your track's own grid, like setting the downbeat in rekordbox: > 0 = your beats land later than
+    // Ableton's bar lines. Moves the learned grid, the pair readings, the live readings and the
+    // timing of the beat-synced corrections (ducking, attack, tail, mud). -0.5 .. +0.5 bar.
+    double getSongGridOffsetBars() const { return songGridOffsetBars; }
+    void setSongGridOffsetBars (double bars);
+    double songGridSec() const { return learnBpm > 0 ? songGridOffsetBars * 240.0 / learnBpm : 0.0; }
+    // the nearest hit (a kick or other attack) to a time in your learned track, in song bars
+    double snapToHit (double songBar) const;
     void addPairExplicit (int songStart, int songEnd, int slot, int refStart, int refBars);
     bool editPair (int index, int songStart, int songEnd, int slot, int refStart, int refBars);
     const gs::ReferenceTrack* getLearnedTrack() const { return learnedTrack.get(); }
@@ -406,6 +414,8 @@ private:
     // Phase 4, message thread
     ViewMode viewMode = ViewMode::out;
     double alignOffsetBars = 0.0;
+    double songGridOffsetBars = 0.0;
+    std::atomic<double> songGridSteps { 0.0 };                   // the same, in 16ths, for the audio thread
     std::vector<int> pairsToSimulate;
     juce::uint32 simDue = 0;
     int simRunning = 0;
