@@ -18,7 +18,9 @@ enum class CheckId
     mono, tuning, kickBass, beatShape, subLevel, punch, mud, squash, djPlayback,
     numChecks,
     // information cards (never block the match %)
-    fineTune, loudnessGap, keyInfo, oneBeat, thinMud
+    fineTune, loudnessGap, keyInfo, oneBeat, thinMud,
+    // Phase 4: master bus check (advice only)
+    masterTone, masterWidth, masterLowMono, masterSquash, masterLoudness, masterChain
 };
 constexpr int kNumChecks = (int) CheckId::numChecks;
 
@@ -88,6 +90,10 @@ public:
     bool hasSnapshot() const { return snapValid; }
     // holdForLoop = false for saved readouts (a learned pair): passes tick straight away
     void update (const CoachInputs& in, double nowSec, bool holdForLoop = true);
+
+    // a ready-made report (the master bus check), shown through the same checklist and cards
+    void setReport (std::vector<CheckRow> r, std::vector<FixCard> c, float pct, const juce::String& line)
+    { rows = std::move (r); fixCards = std::move (c); percent = pct; status = line; }
 
     const std::vector<CheckRow>& checks() const { return rows; }
     const std::vector<FixCard>& cards() const { return fixCards; }

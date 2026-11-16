@@ -16,6 +16,13 @@ void Biquad::setLowPass (double sr, double f, double q)
     a1 = -2.0 * c / a0;         a2 = (1.0 - alpha) / a0;
 }
 
+void Biquad::setLowPass1 (double sr, double f)
+{
+    const double k = std::tan (juce::MathConstants<double>::pi * juce::jmin (f, sr * 0.45) / sr);
+    b0 = k / (1.0 + k);  b1 = b0;  b2 = 0.0;
+    a1 = (k - 1.0) / (1.0 + k);  a2 = 0.0;
+}
+
 void Biquad::setHighPass (double sr, double f, double q)
 {
     const double w0 = juce::MathConstants<double>::twoPi * f / sr;

@@ -75,33 +75,64 @@ private:
 class ArrangementView : public juce::Component
 {
 public:
-    explicit ArrangementView (GroundShakeProcessor& p) : proc (p) {}
+    explicit ArrangementView (GroundShakeProcessor& p);
     void paint (juce::Graphics&) override;
+    void resized() override;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
     void mouseMove (const juce::MouseEvent&) override;
-    bool getDraft (int& a, int& b) const;
-    void clearDraft() { draftA = draftB = -1; repaint(); }
-    std::function<void()> onDraftChanged;
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
+    void mouseMagnify (const juce::MouseEvent&, float scale) override;
+    bool keyPressed (const juce::KeyPress&) override;
 
     static juce::Colour pairColour (int index);
 
+    // Phase 4: guided pairing. editIndex < 0 = a new pair
+    void startPairing (int editIndex);
+    void cancelPairing();
+    bool isPairing() const { return step != Step::none; }
+    juce::String prompt() const;
+    std::function<void()> onPairingChanged;
+
+    // zoom (the view of the shared timeline)
+    void zoomBy (double factor, float aroundX);
+    void zoomToFit() { fit = true; repaint(); }
+
 private:
-    juce::Rectangle<float> refLane() const  { return { 16.0f, 30.0f, (float) getWidth() - 32.0f, 60.0f }; }
-    juce::Rectangle<float> songLane() const { return { 16.0f, 98.0f, (float) getWidth() - 32.0f, 60.0f }; }
-    float xForTime (double sec) const;
-    double timeForX (float x) const;
+    // shared timeline, in bars: T = reference bar (from its grid); your song bar s sits at T = s + offset
+    juce::Rectangle<float> refLane() const  { return { 16.0f, 30.0f, (float) getWidth() - 32.0f, 50.0f }; }
+    juce::Rectangle<float> songLane() const { return { 16.0f, 86.0f, (float) getWidth() - 32.0f, 50.0f }; }
+    double refBarSec() const;
+    double refT0() const;                              // where the reference audio starts / ends, in T
+    double refT1() const;
+    double songT0() const { return proc.getAlignOffsetBars(); }
     int songBarsShown() const;
-    float xForBar (double bar) const;
-    double barForX (float x) const;
+    void currentView (double& start, double& bars) const;
+    float xForT (double t) const;
+    double tForX (float x) const;
+    float xForTime (double sec) const { return xForT ((sec - proc.getGridStartSec()) / refBarSec()); }
+    float xForBar (double songBar) const { return xForT (songBar + proc.getAlignOffsetBars()); }
+    double barForX (float x) const { return tForX (x) - proc.getAlignOffsetBars(); }
+    int refBarForX (float x) const { return (int) std::floor (tForX (x)); }
     int pairAt (float x, int& edge) const;            // edge: -1 start, +1 end, 0 inside
+    void drawLaneWave (juce::Graphics&, juce::Rectangle<float> lane, bool reference, float x0, float x1, juce::Colour inside, juce::Colour outside);
+    void finishPairing (int refStart, int refBars);
+    void refreshButtons();
 
     GroundShakeProcessor& proc;
-    enum class Drag { none, refWindow, draft, resizeStart, resizeEnd };
+    enum class Drag { none, refWindow, draft, resizeStart, resizeEnd, refPick };
     Drag drag = Drag::none;
     int dragGrabBarOffset = 0, dragPair = -1, tempA = 0, tempB = 0;
     int draftA = -1, draftB = -1, draftAnchor = -1;
+    int refA = -1, refB = -1, refAnchor = -1;
+    bool fit = true;
+    double viewStart = 0.0, viewBars = 16.0;
+    enum class Step { none, song, ref };
+    Step step = Step::none;
+    int editIndex = -1;
+    juce::TextButton nudgeL { "<" }, nudgeR { ">" }, nudgeZero { "0" }, zoomOut { "-" }, zoomIn { "+" }, zoomFit { "FIT" },
+                     nextButton { "NEXT" }, cancelButton { "CANCEL" };
 };
 
 //==============================================================================
@@ -190,7 +221,9 @@ private:
     juce::TextButton slotA { "A" }, slotB { "B" };
     juce::TextButton learnButton { "LEARN" }, learnPairButton { "LEARN PAIR" }, addPairButton { "+ PAIR" },
                      deletePairButton { "DELETE" }, autoPairButton { "AUTO-PAIR" }, matchAllButton { "MATCH ALL" },
-                     followButton { "FOLLOW" }, startDown { "<" }, startUp { ">" };
+                     followButton { "FOLLOW" }, startDown { "<" }, startUp { ">" }, editPairButton { "EDIT" };
+    // Phase 4: what the checklist and cards describe
+    juce::TextButton viewMix { "MIX" }, viewOut { "OUT" }, viewMaster { "MASTER" };
     // correction panel
     juce::Slider feelKnob, punchKnob, attackKnob, tailKnob, mudKnob, lowCutKnob;
     std::array<juce::Slider, 4> duckKnobs;

@@ -36,6 +36,7 @@ struct Biquad
     double z1 = 0, z2 = 0;
 
     void setLowPass  (double sr, double f, double q = 0.70710678);
+    void setLowPass1 (double sr, double f);                // 1st order: in - LP1 is an exact high-pass
     void setHighPass (double sr, double f, double q = 0.70710678);
     void setPeak     (double sr, double f, double q, double gainDb);
     void setBandPass (double sr, double f, double q);      // 0 dB at the centre

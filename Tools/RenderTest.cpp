@@ -171,9 +171,69 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
                      i + 1, c.feelDb, c.punchDb, c.duckDb[0], c.duckDb[1], c.duckDb[2], c.duckDb[3], c.attackDb, c.tailDb,
                      c.tailStartMs, c.mudDb, c.lowCutHz, (int) c.mono, c.weight);
     }
+    // ---- Phase 4: OUT readouts, worked out without playback
+    for (int i = 0; i < 400; ++i) { pump (30); if (! proc.isWorkingOutOut()) break; }
+    pump (300);
+    std::printf ("\nPHASE 4 - MIX vs OUT (no playback): %s\n", proc.getLearnMessage().toRawUTF8());
+    {
+        const char* light[] = { "--", "GREEN", "AMBER", "RED" };
+        for (int i = 0; i < (int) proc.getPairs().size(); ++i)
+        {
+            const auto& p = proc.getPairs()[(size_t) i];
+            std::printf ("  pair %d: MIX %s (shake %.2f dB)  OUT %s (shake %.2f dB) outValid %d neutral %d\n", i + 1, light[p.status], p.you.shakeDb(),
+                         light[p.outStatus], p.outYou.shakeDb(), (int) p.outValid, (int) p.corr.isNeutral());
+            for (auto& r : p.outCoach.checks())
+                if (r.status != gs::Status::pass) std::printf ("      OUT [%s] %s %s\n", statusName (r.status), r.name.toRawUTF8(), r.value.toRawUTF8());
+        }
+    }
+    // OUT with a neutral correction must read the same as MIX; one knob must move the right reading
+    {
+        proc.selectPair (0);
+        const auto saved = proc.getPairs()[0].corr;
+        proc.setEditedCorrection (gs::MatchSettings());
+        pump (500);
+        for (int i = 0; i < 200; ++i) { pump (30); if (! proc.isWorkingOutOut()) break; }
+        const auto& p0 = proc.getPairs()[0];
+        auto bsM = gs::beatShape (p0.you, p0.ref), bsO = gs::beatShape (p0.outYou, p0.ref);
+        std::printf ("\nneutral correction: MIX shake %.3f dB, OUT shake %.3f dB, kick 16th %.2f vs %.2f (must match)\n",
+                     p0.you.shakeDb(), p0.outYou.shakeDb(), bsM.diff[0], bsO.diff[0]);
+        gs::MatchSettings d;  d.duckDb[0] = -6.0f;
+        proc.setEditedCorrection (d);
+        pump (500);
+        for (int i = 0; i < 200; ++i) { pump (30); if (! proc.isWorkingOutOut()) break; }
+        bsO = gs::beatShape (proc.getPairs()[0].outYou, p0.ref);
+        std::printf ("duck 16th 1 by -6 dB: kick 16th %.2f -> %.2f dB (must drop)\n", bsM.diff[0], bsO.diff[0]);
+        proc.setEditedCorrection (saved);
+        proc.matchAllPairs();
+        for (int i = 0; i < 400; ++i) { pump (30); if (! proc.isWorkingOutOut()) break; }
+        pump (300);
+        std::printf ("MATCH ALL again (fine-tuned by OUT): %s\n", proc.getLearnMessage().toRawUTF8());
+        const char* light[] = { "--", "GREEN", "AMBER", "RED" };
+        for (int i = 0; i < (int) proc.getPairs().size(); ++i)
+        {
+            const auto& p = proc.getPairs()[(size_t) i];
+            std::printf ("  pair %d: MIX %s  OUT %s  duck %+.1f %+.1f %+.1f %+.1f feel %+.1f punch %+.1f\n", i + 1, light[p.status], light[p.outStatus],
+                         p.corr.duckDb[0], p.corr.duckDb[1], p.corr.duckDb[2], p.corr.duckDb[3], p.corr.feelDb, p.corr.punchDb);
+            for (auto& r : p.outCoach.checks())
+                if (r.status != gs::Status::pass && r.status != gs::Status::info) std::printf ("      OUT [%s] %s %s\n", statusName (r.status), r.name.toRawUTF8(), r.value.toRawUTF8());
+        }
+    }
+    // master bus check
+    for (int i = 0; i < 300; ++i) { pump (30); if (proc.hasMasterReport()) break; }
+    proc.setViewMode (GroundShakeProcessor::ViewMode::master);
+    std::printf ("\nMASTER CHECK: %s\n", proc.getMasterCoach().statusLine().toRawUTF8());
+    for (auto& r : proc.getMasterCoach().checks())
+        std::printf ("  [%s] %s: %s\n", statusName (r.status), r.name.toRawUTF8(), r.value.toRawUTF8());
+    for (auto& c : proc.getDisplayCards())
+    {
+        std::printf ("  card: %s - %s\n", c.title.toRawUTF8(), c.headline.toRawUTF8());
+        for (auto& h : c.how) std::printf ("      - %s\n", h.toRawUTF8());
+    }
+    proc.setViewMode (GroundShakeProcessor::ViewMode::out);
     proc.selectPair (1);
     pump (200);
-    std::printf ("\nselected pair 2: showing %s readout. Cards with what Ground Shake fixed:\n", proc.isShowingSavedPair() ? "SAVED" : "LIVE");
+    std::printf ("\nselected pair 2: showing %s readout, OUT on show %d. Cards with what Ground Shake fixed:\n",
+                 proc.isShowingSavedPair() ? "SAVED" : "LIVE", (int) proc.isShowingOut());
     for (auto& c : proc.getDisplayCards())
         std::printf ("  %s\n    fixed: %s\n", c.title.toRawUTF8(), c.fixed.toRawUTF8());
 
@@ -206,6 +266,28 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
     proc.selectPair (1);
     std::printf ("\nplayback with corrections: max change inside pairs %.4f (%d blocks), outside pairs %.9f (must be 0)\n", inD, blocksIn, outD);
 
+    // Phase 4: moving the window with a pair selected must not change it
+    {
+        proc.selectPair (0);
+        const auto before = proc.getPairs()[0];
+        proc.setWindowStartBar (before.refStart + 3);
+        std::printf ("\nwindow moved with pair 1 selected: pair ref start %d -> %d (must not change), selected now %d\n",
+                     before.refStart, proc.getPairs()[0].refStart, proc.getSelectedPair());
+        // EDIT PAIR: same stretch, new reference bars
+        const bool ok = proc.editPair (0, before.songStart, before.songEnd, 0, 2, 2);
+        for (int i = 0; i < 200; ++i) { pump (30); if (proc.getPairs()[0].analyzed && ! proc.isWorkingOutOut()) break; }
+        std::printf ("edit pair 1 -> ref bars 3-4: ok %d, now ref %d-%d, analyzed %d, %s\n", (int) ok, proc.getPairs()[0].refStart + 1,
+                     proc.getPairs()[0].refStart + proc.getPairs()[0].refBars, (int) proc.getPairs()[0].analyzed, proc.getLearnMessage().toRawUTF8());
+        // overlapping edit is refused
+        int manualOther = -1;
+        for (int i = 1; i < (int) proc.getPairs().size(); ++i) if (proc.getPairs()[(size_t) i].manual) manualOther = i;
+        if (manualOther < 0 && proc.getPairs().size() > 1) { proc.setPairRange (1, proc.getPairs()[1].songStart, proc.getPairs()[1].songEnd - 1); manualOther = 1; }
+        const bool bad = manualOther > 0 && proc.editPair (0, proc.getPairs()[(size_t) manualOther].songStart, proc.getPairs()[(size_t) manualOther].songEnd, 0, 0, 4);
+        for (int i = 0; i < 200; ++i) { pump (30); bool all = true; for (auto& q : proc.getPairs()) all = all && q.analyzed; if (all) break; }
+        std::printf ("overlapping edit refused: %d (%s)\n", (int) ! bad, proc.getLearnMessage().toRawUTF8());
+        proc.setAlignOffsetBars (2.25);
+    }
+
     // save and restore
     juce::MemoryBlock state;
     proc.getStateInformation (state);
@@ -217,6 +299,12 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
     std::printf ("state: %d bytes; restored %d pairs, learned bars %d, pair 1 light %d, pair 2 corr lowcut %.0f\n", (int) state.getSize(),
                  (int) proc2.getPairs().size(), proc2.getLearnedBars(), proc2.getPairs().empty() ? -1 : proc2.getPairs()[0].status,
                  proc2.getPairs().size() > 1 ? proc2.getPairs()[1].corr.lowCutHz : -1.0f);
+    {
+        int outs = 0;
+        for (auto& p : proc2.getPairs()) outs += p.outValid ? 1 : 0;
+        std::printf ("restored: align offset %.2f bars, view mode %d, %d pairs with OUT readouts\n", proc2.getAlignOffsetBars(),
+                     (int) proc2.getViewMode(), outs);
+    }
 
     // screenshot with pair 2 selected
     std::unique_ptr<juce::AudioProcessorEditor> ed (proc.createEditor());
@@ -227,6 +315,35 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
     juce::FileOutputStream os (outPng);
     juce::PNGImageFormat().writeImageToStream (img, os);
     std::printf ("saved %s\n", outPng.getFullPathName().toRawUTF8());
+    // more shots: guided pairing, zoomed in, master view
+    std::function<ArrangementView* (juce::Component*)> findArr = [&] (juce::Component* c) -> ArrangementView*
+    {
+        if (auto* a = dynamic_cast<ArrangementView*> (c)) return a;
+        for (auto* ch : c->getChildren()) if (auto* r = findArr (ch)) return r;
+        return nullptr;
+    };
+    auto shot = [&] (const juce::String& suffix)
+    {
+        for (int i = 0; i < 20; ++i) juce::MessageManager::getInstance()->runDispatchLoopUntil (17);
+        auto im = ed->createComponentSnapshot (ed->getLocalBounds(), true, 1.0f);
+        auto f = outPng.getSiblingFile (outPng.getFileNameWithoutExtension() + suffix + ".png");
+        f.deleteFile();
+        juce::FileOutputStream o2 (f);
+        juce::PNGImageFormat().writeImageToStream (im, o2);
+        std::printf ("saved %s\n", f.getFullPathName().toRawUTF8());
+    };
+    if (auto* arr = findArr (ed.get()))
+    {
+        proc.setAlignOffsetBars (0.0);
+        arr->startPairing (-1);
+        shot ("_pairing");
+        arr->cancelPairing();
+        arr->zoomBy (0.12, 300.0f);
+        shot ("_zoom");
+        arr->zoomToFit();
+    }
+    proc.setViewMode (GroundShakeProcessor::ViewMode::master);
+    shot ("_master");
     ed.reset();
     return 0;
 }

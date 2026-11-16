@@ -48,6 +48,15 @@ struct Pair
     // correction
     gs::MatchSettings corr;
     MatchState state = MatchState::off;
+
+    // Phase 4: OUT = this pair with its correction, worked out on the learned audio (no playback needed)
+    bool outValid = false;
+    gs::StepProfile outYou;
+    gs::Measurements outYouM;
+    gs::Coach outCoach;
+    int outStatus = 0;                  // 0 = not worked out, 1 green, 2 amber, 3 red
+    bool corrAuto = false;              // the correction came from MATCH (so OUT may fine-tune it), not from the knobs
+    bool correctionOn() const { return state == MatchState::applied || state == MatchState::preview; }
 };
 
 // What the audio thread needs to switch corrections by playhead position
@@ -216,6 +225,26 @@ public:
     MatchState getEditedMatchState() const;
     void setEditedCorrection (const gs::MatchSettings& s);      // a hand tweak: switches it on
 
+    //==========================================================================
+    // Phase 4
+    enum class ViewMode { mix, out, master };                    // what the checklist and cards describe
+    ViewMode getViewMode() const { return viewMode; }
+    void setViewMode (ViewMode m);
+    double getAlignOffsetBars() const { return alignOffsetBars; } // where your track sits under the reference (bars)
+    void setAlignOffsetBars (double bars);
+    void addPairExplicit (int songStart, int songEnd, int slot, int refStart, int refBars);
+    bool editPair (int index, int songStart, int songEnd, int slot, int refStart, int refBars);
+    const gs::ReferenceTrack* getLearnedTrack() const { return learnedTrack.get(); }
+    double getLearnBpm() const { return learnBpm; }
+    bool isWorkingOutOut() const { return simRunning > 0 || ! pairsToSimulate.empty(); }
+    bool isShowingOut() const;                                   // the selected pair's OUT readout is on show
+    const gs::Coach& getMasterCoach() const { return masterCoach; }
+    bool hasMasterReport() const { return masterValid; }
+    bool isMasterRunning() const { return masterRunning || masterPending; }
+    void refreshMasterCheck() { masterPending = true; }
+    // test hook: run queued background work (pair analysis, OUT, master check) right away
+    void runQueuedWorkNow();
+
     // test hook: run the live analysis now (normally a background thread does this every second)
     void runLiveAnalysisNow() { runLiveAnalysis(); }
     void updateCoachNow() { updateCoach(); }
@@ -244,6 +273,11 @@ private:
     int slotDropBar (int slot) const;
     void updateSections();
     void applyHostLoop();
+    void simulatePair (int index);
+    void requestSimulation (int index, int delayMs = 0);
+    void refreshOutCoach (Pair& p, int index);
+    void runMasterCheck();
+    void deselectForWindowChange();
 
     struct LiveAnalyzer : juce::Thread
     {
@@ -368,6 +402,21 @@ private:
     bool switchingForPair = false, buildRunning = false;
     double otherPendingBpm = 0, otherPendingOffset = 0;
     int otherPendingStart = -1;
+
+    // Phase 4, message thread
+    ViewMode viewMode = ViewMode::out;
+    double alignOffsetBars = 0.0;
+    std::vector<int> pairsToSimulate;
+    juce::uint32 simDue = 0;
+    int simRunning = 0;
+    bool simSummaryPending = false;
+    gs::Coach masterCoach;
+    bool masterValid = false, masterPending = false, masterRunning = false;
+    const void* masterRefSeen = nullptr;
+    const void* masterLtSeen = nullptr;
+    // audio thread: the mix before the correction, for MIX readings while playing
+    std::atomic<bool> meterBeforeCorrection { false };
+    std::vector<float> preL, preR;
 
     // restored state waiting for its file to load
     int pendingStartBar = -1;

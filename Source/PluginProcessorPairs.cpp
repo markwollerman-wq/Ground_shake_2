@@ -109,6 +109,62 @@ namespace
     }
 
     juce::String sdb (float v) { return (v >= 0 ? "+" : "-") + juce::String (std::abs (v), 1) + " dB"; }
+
+    // A stretch of a reference, anti-alias filtered and resampled to the learned track's rate,
+    // so both sides go through the same filters
+    juce::AudioBuffer<float> windowAtRate (const gs::ReferenceTrack& rt, int s0, int n0, double lsr)
+    {
+        const double rsr = rt.sampleRate;
+        s0 = juce::jlimit (0, juce::jmax (0, rt.audio.getNumSamples() - 1), s0);
+        n0 = juce::jmin (n0, rt.audio.getNumSamples() - s0);
+        const double ratio = rsr / lsr;
+        const int n1 = (int) (n0 / ratio) - 4;
+        if (n0 <= 0 || n1 <= 0) return {};
+        juce::AudioBuffer<float> src (2, n0), w (2, n1);
+        for (int c = 0; c < 2; ++c)
+        {
+            gs::Biquad f1, f2;
+            f1.setLowPass (rsr, lsr * 0.45);  f2.setLowPass (rsr, lsr * 0.45);
+            const float* in = rt.audio.getReadPointer (juce::jmin (c, rt.audio.getNumChannels() - 1)) + s0;
+            float* o = src.getWritePointer (c);
+            for (int i = 0; i < n0; ++i) o[i] = f2.process (f1.process (in[i]));
+            juce::LagrangeInterpolator li;
+            li.process (ratio, src.getReadPointer (c), w.getWritePointer (c), n1);
+        }
+        return w;
+    }
+
+    // whole-band crest (peak over RMS) and stereo width (side vs mid), for the master check
+    struct Spread { float crestDb = 0, sideDb = -60, sideHighDb = -60; bool valid = false; };
+    Spread measureSpread (const juce::AudioBuffer<float>& a, int s0, int n, double rate)
+    {
+        Spread r;
+        s0 = juce::jmax (0, s0);
+        n = juce::jmin (n, a.getNumSamples() - s0);
+        if (n < (int) rate) return r;
+        const float* L = a.getReadPointer (0) + s0;
+        const float* R = a.getReadPointer (juce::jmin (1, a.getNumChannels() - 1)) + s0;
+        gs::Biquad hm1, hm2, hs1, hs2;                       // above 300 Hz: the width you hear
+        hm1.setHighPass (rate, 300.0);  hm2.setHighPass (rate, 300.0);
+        hs1.setHighPass (rate, 300.0);  hs2.setHighPass (rate, 300.0);
+        double pk = 0, ms = 0, mid = 0, side = 0, midH = 0, sideH = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            const float l = L[i], rr = R[i];
+            pk = std::max (pk, (double) std::max (std::abs (l), std::abs (rr)));
+            ms += 0.5 * (l * l + rr * rr);
+            const float m = 0.5f * (l + rr), sd = 0.5f * (l - rr);
+            mid += m * m;  side += sd * sd;
+            const float mh = hm2.process (hm1.process (m)), sh = hs2.process (hs1.process (sd));
+            midH += mh * mh;  sideH += sh * sh;
+        }
+        if (ms <= 1.0e-12 || mid <= 1.0e-12) return r;
+        r.crestDb = (float) (20.0 * std::log10 (pk / std::sqrt (ms / n)));
+        r.sideDb = (float) (10.0 * std::log10 (std::max (1.0e-12, side) / mid));
+        r.sideHighDb = (float) (10.0 * std::log10 (std::max (1.0e-12, sideH) / std::max (1.0e-12, midH)));
+        r.valid = true;
+        return r;
+    }
 }
 
 //==============================================================================
@@ -160,19 +216,19 @@ void GroundShakeProcessor::setActiveSlot (int slot)
             updateCoach();
         }
     }
-    // switching the tab while a pair is selected moves that pair to this reference
-    if (! switchingForPair && selectedPair >= 0 && selectedPair < (int) pairs.size() && reference != nullptr)
-    {
-        auto& p = pairs[(size_t) selectedPair];
-        if (p.slot != slot)
-        {
-            p.slot = slot;
-            p.refStart = windowStartBar;
-            p.refBars = windowBars;
-            pairsToAnalyze.push_back (selectedPair);
-        }
-    }
+    // Phase 4: switching the tab never moves a pair (use EDIT PAIR); it lets go of it instead
+    if (! switchingForPair && selectedPair >= 0 && selectedPair < (int) pairs.size() && pairs[(size_t) selectedPair].slot != slot)
+        deselectForWindowChange();
     if (onReferenceChanged) onReferenceChanged();
+}
+
+void GroundShakeProcessor::deselectForWindowChange()
+{
+    if (switchingForPair || selectedPair < 0) return;
+    selectedPair = -1;
+    followPlayhead = false;
+    coach.reset();
+    updateCoach();
 }
 
 //==============================================================================
@@ -328,10 +384,19 @@ void GroundShakeProcessor::selectPair (int index, bool fromFollow)
 
 void GroundShakeProcessor::addPair (int songStart, int songEnd)
 {
+    addPairExplicit (songStart, songEnd, activeSlot, windowStartBar, windowBars);
+}
+
+namespace { int snapRefBars (int b) { int r = 1; for (int c : { 1, 2, 4, 8 }) if (b >= c) r = c; return r; } }
+
+void GroundShakeProcessor::addPairExplicit (int songStart, int songEnd, int slot, int refStart, int refBars)
+{
+    slot = juce::jlimit (0, 1, slot);
+    refBars = snapRefBars (refBars);
     if (songEnd < songStart) std::swap (songStart, songEnd);
     songStart = juce::jmax (0, songStart);
     songEnd = juce::jmax (songStart + 1, songEnd);
-    if (reference == nullptr) { learnMessage = "Load a reference first."; if (onReferenceChanged) onReferenceChanged(); return; }
+    if (slotTrack (slot) == nullptr) { learnMessage = "Load a reference first."; if (onReferenceChanged) onReferenceChanged(); return; }
     if (learnedBars <= 0)     { learnMessage = "Press LEARN and play your song first."; if (onReferenceChanged) onReferenceChanged(); return; }
     for (auto& q : pairs)
         if (q.manual && songStart < q.songEnd && songEnd > q.songStart)
@@ -345,9 +410,9 @@ void GroundShakeProcessor::addPair (int songStart, int songEnd)
                                  { return ! q.manual && songStart < q.songEnd && songEnd > q.songStart; }),
                  pairs.end());
     Pair p;
-    p.slot = activeSlot;
-    p.refStart = windowStartBar;
-    p.refBars = windowBars;
+    p.slot = slot;
+    p.refStart = refStart;
+    p.refBars = refBars;
     p.songStart = songStart;
     p.songEnd = songEnd;
     p.manual = true;
@@ -361,10 +426,50 @@ void GroundShakeProcessor::addPair (int songStart, int songEnd)
     pairsToAnalyze.clear();
     for (int i = 0; i < (int) pairs.size(); ++i) if (! pairs[(size_t) i].analyzed || i == idx) pairsToAnalyze.push_back (i);
     learnMessage = "Pair " + juce::String (idx + 1) + ": your bars " + juce::String (getEffectiveStartBar() + songStart) + "-"
-                   + juce::String (getEffectiveStartBar() + songEnd - 1) + " matched to " + getSlotName (activeSlot) + " bars "
-                   + juce::String (windowStartBar + 1) + "-" + juce::String (windowStartBar + windowBars) + ".";
+                   + juce::String (getEffectiveStartBar() + songEnd - 1) + " matched to " + getSlotName (slot) + " bars "
+                   + juce::String (refStart + 1) + "-" + juce::String (refStart + refBars) + ".";
     selectPair (idx);
     pushCorrectionTable();
+}
+
+bool GroundShakeProcessor::editPair (int index, int songStart, int songEnd, int slot, int refStart, int refBars)
+{
+    if (index < 0 || index >= (int) pairs.size()) return false;
+    slot = juce::jlimit (0, 1, slot);
+    refBars = snapRefBars (refBars);
+    if (songEnd < songStart) std::swap (songStart, songEnd);
+    songStart = juce::jmax (0, songStart);
+    songEnd = juce::jmax (songStart + 1, songEnd);
+    if (slotTrack (slot) == nullptr) { learnMessage = "Load that reference first."; if (onReferenceChanged) onReferenceChanged(); return false; }
+    for (int i = 0; i < (int) pairs.size(); ++i)
+        if (i != index && pairs[(size_t) i].manual && songStart < pairs[(size_t) i].songEnd && songEnd > pairs[(size_t) i].songStart)
+        {
+            learnMessage = "That overlaps pair " + juce::String (i + 1) + ": pick a free stretch, or delete that pair first.";
+            if (onReferenceChanged) onReferenceChanged();
+            return false;
+        }
+    auto edited = pairs[(size_t) index];
+    pairs.erase (pairs.begin() + index);
+    // auto pairs give way
+    pairs.erase (std::remove_if (pairs.begin(), pairs.end(), [&] (const Pair& q)
+                                 { return ! q.manual && songStart < q.songEnd && songEnd > q.songStart; }),
+                 pairs.end());
+    edited.slot = slot;  edited.refStart = refStart;  edited.refBars = refBars;
+    edited.songStart = songStart;  edited.songEnd = songEnd;  edited.manual = true;
+    edited.analyzed = false;  edited.outValid = false;  edited.status = 0;  edited.outStatus = 0;
+    pairs.push_back (edited);
+    std::sort (pairs.begin(), pairs.end(), [] (const Pair& a, const Pair& b) { return a.songStart < b.songStart; });
+    int idx = 0;
+    for (int i = 0; i < (int) pairs.size(); ++i) if (pairs[(size_t) i].songStart == songStart) idx = i;
+    pairsToAnalyze.clear();
+    pairsToSimulate.clear();
+    for (int i = 0; i < (int) pairs.size(); ++i) if (! pairs[(size_t) i].analyzed) pairsToAnalyze.push_back (i);
+    learnMessage = "Pair " + juce::String (idx + 1) + " changed: your bars " + juce::String (getEffectiveStartBar() + songStart) + "-"
+                   + juce::String (getEffectiveStartBar() + songEnd - 1) + " matched to " + getSlotName (slot) + " bars "
+                   + juce::String (refStart + 1) + "-" + juce::String (refStart + refBars) + ". Measuring...";
+    selectPair (idx);
+    pushCorrectionTable();
+    return true;
 }
 
 void GroundShakeProcessor::deletePair (int index)
@@ -372,6 +477,7 @@ void GroundShakeProcessor::deletePair (int index)
     if (index < 0 || index >= (int) pairs.size()) return;
     pairs.erase (pairs.begin() + index);
     pairsToAnalyze.clear();
+    pairsToSimulate.clear();
     if (selectedPair == index) selectedPair = -1;
     else if (selectedPair > index) --selectedPair;
     pushCorrectionTable();
@@ -392,6 +498,7 @@ void GroundShakeProcessor::setPairRange (int index, int songStart, int songEnd)
     p.songStart = songStart;
     p.songEnd = songEnd;
     p.manual = true;
+    p.outValid = false;
     if (std::find (pairsToAnalyze.begin(), pairsToAnalyze.end(), index) == pairsToAnalyze.end()) pairsToAnalyze.push_back (index);
     pushCorrectionTable();
     if (onReferenceChanged) onReferenceChanged();
@@ -468,6 +575,7 @@ void GroundShakeProcessor::autoPair()
     }
     std::sort (pairs.begin(), pairs.end(), [] (const Pair& a, const Pair& b) { return a.songStart < b.songStart; });
     pairsToAnalyze.clear();
+    pairsToSimulate.clear();
     for (int i = 0; i < (int) pairs.size(); ++i) pairsToAnalyze.push_back (i);
     selectedPair = -1;
     learnMessage = made > 0 ? "Auto-paired " + juce::String (made) + (made == 1 ? " section" : " sections")
@@ -484,9 +592,12 @@ void GroundShakeProcessor::matchAllPairs()
         auto& p = pairs[(size_t) i];
         if (! p.analyzed) continue;
         p.corr = autoCorrection (p);
+        p.corrAuto = true;
         p.state = MatchState::applied;
         refreshPairCoach (p, i);
+        requestSimulation (i);
     }
+    simSummaryPending = true;
     pushCorrectionTable();
     if (onReferenceChanged) onReferenceChanged();
 }
@@ -530,26 +641,9 @@ void GroundShakeProcessor::analyzePair (int index)
         // measure the reference window at the learned track's rate, so both sides go through the same filters
         gs::Measurements refM2;
         {
-            const int s0 = juce::jlimit (0, rt->audio.getNumSamples() - 1, (int) ((rt->firstDownbeatSec + ro + spec.refStart * barR) * rsr));
-            const int n0 = juce::jmin ((int) (spec.refBars * barR * rsr), rt->audio.getNumSamples() - s0);
-            const double ratio = rsr / lsr;
-            const int n1 = (int) (n0 / ratio) - 4;
-            if (n1 > 0)
-            {
-                // the same anti-alias filter the learn pass uses, then resample
-                juce::AudioBuffer<float> src (2, n0), w (2, n1);
-                for (int c = 0; c < 2; ++c)
-                {
-                    gs::Biquad f1, f2;
-                    f1.setLowPass (rsr, lsr * 0.45);  f2.setLowPass (rsr, lsr * 0.45);
-                    const float* in = rt->audio.getReadPointer (c) + s0;
-                    float* o = src.getWritePointer (c);
-                    for (int i = 0; i < n0; ++i) o[i] = f2.process (f1.process (in[i]));
-                    juce::LagrangeInterpolator li;
-                    li.process (ratio, src.getReadPointer (c), w.getWritePointer (c), n1);
-                }
-                refM2 = gs::measureAudio (w, 0, n1, lsr, 0.0, barR / 4.0 * lsr, sp);
-            }
+            const int s0 = (int) ((rt->firstDownbeatSec + ro + spec.refStart * barR) * rsr);
+            const auto w = windowAtRate (*rt, s0, (int) (spec.refBars * barR * rsr), lsr);
+            if (w.getNumSamples() > 0) refM2 = gs::measureAudio (w, 0, w.getNumSamples(), lsr, 0.0, barR / 4.0 * lsr, sp);
         }
         const int dropB = gs::findDropBar (*rt, rb, ro, spec.refBars);
         const float dropShake = gs::profileForWindow (*rt, rb, ro, dropB, spec.refBars).shakeDb();
@@ -577,7 +671,9 @@ void GroundShakeProcessor::analyzePair (int index)
             p.analyzed = true;
             p.needsLearn = false;
             refreshPairCoach (p, i);
-            if (p.state != MatchState::off) p.corr = autoCorrection (p);   // keep a live correction in step
+            if (p.state != MatchState::off) { p.corr = autoCorrection (p); p.corrAuto = true; }   // keep a live correction in step
+            p.outValid = false;
+            if (p.correctionOn()) requestSimulation (i);
             pushCorrectionTable();
             if (pairAnalysisRunning == 0 && pairsToAnalyze.empty() && learnMessage.contains ("Measuring"))
             {
@@ -612,10 +708,163 @@ void GroundShakeProcessor::refreshPairCoach (Pair& p, int index)
     int st = p.analyzed ? 1 : 0;
     for (auto& r : p.coach.checks())
     {
+        // the light is about the low end: limiter squash and DJ playback belong to the MASTER view
+        if (r.id == gs::CheckId::squash || r.id == gs::CheckId::djPlayback) continue;
         if (r.status == gs::Status::fail) st = 3;
         else if (r.status == gs::Status::near && st < 2) st = 2;
     }
     p.status = st;
+}
+
+//==============================================================================
+//  OUT: the pair's learned audio run through its correction, then measured like the mix
+//==============================================================================
+void GroundShakeProcessor::requestSimulation (int index, int delayMs)
+{
+    if (index < 0 || index >= (int) pairs.size()) return;
+    if (std::find (pairsToSimulate.begin(), pairsToSimulate.end(), index) == pairsToSimulate.end()) pairsToSimulate.push_back (index);
+    simDue = juce::Time::getMillisecondCounter() + (juce::uint32) juce::jmax (0, delayMs);
+}
+
+void GroundShakeProcessor::simulatePair (int index)
+{
+    if (index < 0 || index >= (int) pairs.size()) return;
+    auto& p = pairs[(size_t) index];
+    auto lt = learnedTrack;
+    if (lt == nullptr || ! p.analyzed || ! p.correctionOn()) { if (! p.correctionOn()) p.outValid = false; return; }
+    ++simRunning;
+    auto flag = alive;
+    const double lb = learnBpm;
+    const Pair spec = p;
+    auto corr = p.corr;
+    corr.split = split;
+    const float sp = split;
+    const bool tune = p.corrAuto;
+    pool.addJob ([this, flag, lt, lb, spec, corr, sp, index, tune]
+    {
+        const double lsr = lt->sampleRate, barSec = 240.0 / lb;
+        const int nb = juce::jmax (1, juce::jmin (spec.refBars, spec.songEnd - spec.songStart));
+        const int pre = spec.measureStart >= 1 ? 1 : 0;                    // a bar to settle the filters
+        const int s0 = (int) std::round ((spec.measureStart - pre) * barSec * lsr);
+        const int len = juce::jmin ((int) std::round ((nb + pre) * barSec * lsr), lt->audio.getNumSamples() - s0);
+        gs::StepProfile outP;
+        gs::Measurements outM;
+        gs::MatchSettings c = corr;
+        if (s0 >= 0 && len > (int) (barSec * lsr * 0.5))
+        {
+            gs::ReferenceTrack t;
+            t.sampleRate = lsr;
+            t.hop = lt->hop;
+            t.firstDownbeatSec = 0.0;
+            auto run = [&] (const gs::MatchSettings& cs)
+            {
+                t.audio.setSize (2, len, false, false, true);
+                for (int ch = 0; ch < 2; ++ch)
+                    t.audio.copyFrom (ch, 0, lt->audio, juce::jmin (ch, lt->audio.getNumChannels() - 1), s0, len);
+                gs::MatchStage stage;
+                stage.prepare (lsr);
+                const double stepsPerSample = lb / 60.0 * 4.0 / lsr;
+                float* L = t.audio.getWritePointer (0);
+                float* R = t.audio.getWritePointer (1);
+                for (int i = 0; i < len; i += 512)
+                    // a glide of one sample: the correction is fully on from the start
+                    stage.process (L + i, R + i, juce::jmin (512, len - i), cs, true, false, i * stepsPerSample, stepsPerSample, 1.0);
+                gs::computeEnvelopes (t, sp);
+                return gs::profileForWindow (t, lb, 0.0, pre, nb);
+            };
+            outP = run (c);
+            // MATCH's correction is worked out from the two analyses; OUT checks it on the audio and
+            // fine-tunes the level and ducking a few times so the result lands on the reference
+            if (tune && outP.valid && spec.ref.valid && ! spec.breakdown)
+            {
+                for (int iter = 0; iter < 4; ++iter)
+                {
+                    const auto bs = gs::beatShape (outP, spec.ref);
+                    const float df = zoneGainDb (outP.feelTotal, outP.fullTotal, spec.ref.feelTotal, spec.ref.fullTotal);
+                    const float dp = zoneGainDb (outP.punchTotal, outP.fullTotal, spec.ref.punchTotal, spec.ref.fullTotal);
+                    float worst = std::max (std::abs (df), std::abs (dp)) * 2.0f;
+                    if (bs.valid) for (auto d : bs.diff) worst = std::max (worst, std::abs (d));
+                    if (worst < 0.8f) break;
+                    if (bs.valid)
+                    {
+                        // a kick-attack boost adds low end on the kick 16th: back it off before the duck runs out
+                        if (bs.diff[0] > 1.0f && c.duckDb[0] <= -9.0f && c.attackDb > 0.0f) c.attackDb = std::max (0.0f, c.attackDb - 1.5f);
+                        for (size_t k = 0; k < 4; ++k)
+                            if (std::abs (bs.diff[k]) >= 0.5f) c.duckDb[k] = juce::jlimit (-12.0f, 3.0f, c.duckDb[k] - 0.8f * bs.diff[k]);
+                    }
+                    if (std::abs (df) > 0.3f) c.feelDb = juce::jlimit (-6.0f, 6.0f, c.feelDb + 0.8f * df);
+                    if (std::abs (dp) > 0.3f) c.punchDb = juce::jlimit (-6.0f, 6.0f, c.punchDb + 0.8f * dp);
+                    outP = run (c);
+                }
+            }
+            outM = gs::measureAudio (t.audio, (int) (pre * barSec * lsr), (int) (nb * barSec * lsr), lsr, 0.0, barSec / 4.0 * lsr, sp);
+        }
+        juce::MessageManager::callAsync ([this, flag, spec, corr, c, index, outP, outM]
+        {
+            if (! flag->load()) return;
+            --simRunning;
+            int i = index;
+            auto same = [&] (const Pair& x)
+            { return x.songStart == spec.songStart && x.songEnd == spec.songEnd && x.refStart == spec.refStart && x.slot == spec.slot; };
+            if (i >= (int) pairs.size() || ! same (pairs[(size_t) i]))
+            {
+                i = -1;
+                for (int k = 0; k < (int) pairs.size(); ++k) if (same (pairs[(size_t) k])) i = k;
+                if (i < 0) return;
+            }
+            auto& q = pairs[(size_t) i];
+            if (! q.correctionOn()) { q.outValid = false; return; }
+            {
+                auto mine = q.corr;  mine.split = corr.split;
+                if (correctionToString (mine) != correctionToString (corr)) return;   // changed meanwhile: a newer job follows
+            }
+            if (q.corrAuto && correctionToString (c) != correctionToString (corr))
+            {
+                q.corr = c;                       // the fine-tuned correction is what plays
+                pushCorrectionTable();
+            }
+            q.outYou = outP;
+            q.outYouM = outM;
+            q.outValid = outP.valid;
+            refreshOutCoach (q, i);
+            if (onReferenceChanged) onReferenceChanged();
+        });
+    });
+}
+
+void GroundShakeProcessor::refreshOutCoach (Pair& p, int index)
+{
+    if (! p.outValid) { p.outStatus = 0; p.outCoach.reset(); return; }
+    gs::CoachInputs in;
+    in.haveRef = in.haveYou = true;
+    in.you = p.outYou;  in.ref = p.ref;  in.youM = p.outYouM;  in.refM = p.refM;
+    // attack and click can't be heard in the learned audio as well as live: keep the mix's kick reading
+    in.youM.kick.clickDb = p.youM.kick.clickDb;
+    in.tolerance = tolerance;
+    in.refName = p.refName;
+    in.windowStartBar = p.refStart;
+    in.windowBars = p.refBars;
+    in.numRefBars = p.refNumBars;
+    in.dropBar = p.refDropBar;
+    in.breakdownMode = p.breakdown;
+    in.pairMode = true;
+    in.pairLabel = "pair " + juce::String (index + 1) + " with Ground Shake";
+    in.hostBpm = learnBpm > 0 ? learnBpm : hostBpm.load();
+    in.djRefLevel = djRefLevel;
+    p.outCoach.reset();
+    p.outCoach.update (in, 0.0, false);
+    int st = 1;
+    for (auto& r : p.outCoach.checks())
+    {
+        // sound and note choices can't be changed by a correction: they don't count against OUT
+        if (r.id == gs::CheckId::kickType || r.id == gs::CheckId::bassPattern || r.id == gs::CheckId::bassNotes
+            || r.id == gs::CheckId::tuning || r.id == gs::CheckId::section
+            || r.id == gs::CheckId::squash || r.id == gs::CheckId::djPlayback)      // master matters: the MASTER view
+            continue;
+        if (r.status == gs::Status::fail) st = 3;
+        else if (r.status == gs::Status::near && st < 2) st = 2;
+    }
+    p.outStatus = st;
 }
 
 // What Ground Shake can fix by itself for this pair, worked out from the two analyses
@@ -714,13 +963,39 @@ bool GroundShakeProcessor::isShowingSavedPair() const
     return ! liveHere;
 }
 
+bool GroundShakeProcessor::isShowingOut() const
+{
+    if (viewMode != ViewMode::out || ! isShowingSavedPair()) return false;
+    const auto& p = pairs[(size_t) selectedPair];
+    return p.correctionOn() && p.outValid;
+}
+
+void GroundShakeProcessor::setViewMode (ViewMode m)
+{
+    if (m == viewMode) return;
+    viewMode = m;
+    meterBeforeCorrection.store (viewMode == ViewMode::mix && ! pairs.empty());
+    resetRequested.store (true);                // live readings start fresh in the new view
+    if (m == ViewMode::master && ! masterValid) masterPending = true;
+    if (onReferenceChanged) onReferenceChanged();
+}
+
+void GroundShakeProcessor::setAlignOffsetBars (double bars)
+{
+    alignOffsetBars = juce::jlimit (-512.0, 512.0, std::round (bars * 4.0) / 4.0);   // whole beats
+    if (onReferenceChanged) onReferenceChanged();
+}
+
 const gs::Coach& GroundShakeProcessor::getDisplayCoach() const
 {
+    if (viewMode == ViewMode::master) return masterCoach;
+    if (isShowingOut()) return pairs[(size_t) selectedPair].outCoach;
     return isShowingSavedPair() ? pairs[(size_t) selectedPair].coach : coach;
 }
 
 gs::StepProfile GroundShakeProcessor::getDisplayYouProfile() const
 {
+    if (isShowingOut()) return pairs[(size_t) selectedPair].outYou;
     return isShowingSavedPair() ? pairs[(size_t) selectedPair].you : getLiveProfile();
 }
 const gs::StepProfile& GroundShakeProcessor::getDisplayRefProfile() const
@@ -729,6 +1004,7 @@ const gs::StepProfile& GroundShakeProcessor::getDisplayRefProfile() const
 }
 gs::Measurements GroundShakeProcessor::getDisplayYouMeasurements() const
 {
+    if (isShowingOut()) return pairs[(size_t) selectedPair].outYouM;
     return isShowingSavedPair() ? pairs[(size_t) selectedPair].youM : getLiveMeasurements();
 }
 const gs::Measurements& GroundShakeProcessor::getDisplayRefMeasurements() const
@@ -754,7 +1030,9 @@ void GroundShakeProcessor::setEditedCorrection (const gs::MatchSettings& s)
     {
         auto& p = pairs[(size_t) selectedPair];
         p.corr = s;
+        p.corrAuto = false;                              // your settings: OUT measures them as they are
         if (p.state == MatchState::off || p.state == MatchState::ready) p.state = MatchState::applied;
+        requestSimulation (selectedPair, 400);          // re-work OUT once the knob settles
     }
     else
     {
@@ -767,6 +1045,7 @@ void GroundShakeProcessor::setEditedCorrection (const gs::MatchSettings& s)
 std::vector<gs::FixCard> GroundShakeProcessor::getDisplayCards() const
 {
     auto cards = getDisplayCoach().cards();
+    if (viewMode == ViewMode::master) return cards;
     const auto& c = getEditedCorrection();
     const auto st = getEditedMatchState();
     if (st != MatchState::applied && st != MatchState::preview) return cards;
@@ -806,6 +1085,8 @@ std::vector<gs::FixCard> GroundShakeProcessor::getDisplayCards() const
             case gs::CheckId::section: case gs::CheckId::bassPattern: case gs::CheckId::bassNotes: case gs::CheckId::tuning:
             case gs::CheckId::squash: case gs::CheckId::djPlayback: case gs::CheckId::numChecks: case gs::CheckId::fineTune:
             case gs::CheckId::loudnessGap: case gs::CheckId::keyInfo: case gs::CheckId::oneBeat:
+            case gs::CheckId::masterTone: case gs::CheckId::masterWidth: case gs::CheckId::masterLowMono:
+            case gs::CheckId::masterSquash: case gs::CheckId::masterLoudness: case gs::CheckId::masterChain:
             default: break;
         }
         if (! f.isEmpty()) card.fixed = now + f.joinIntoString ("; ") + ". The steps below do it in your own tracks.";
@@ -827,6 +1108,8 @@ void GroundShakeProcessor::savePhase3 (juce::XmlElement& xml) const
     xml.setAttribute ("activeSlot", activeSlot);
     xml.setAttribute ("selectedPair", selectedPair);
     xml.setAttribute ("followPlayhead", followPlayhead);
+    xml.setAttribute ("alignOffsetBars", alignOffsetBars);
+    xml.setAttribute ("viewMode", (int) viewMode);
     if (! ovMin.empty())
     {
         juce::MemoryBlock mb (ovMin.size() * 2);
@@ -873,6 +1156,11 @@ void GroundShakeProcessor::savePhase3 (juce::XmlElement& xml) const
             e->setAttribute ("youM", measurementsToString (p.youM));
             e->setAttribute ("refM", measurementsToString (p.refM));
         }
+        if (p.outValid)
+        {
+            e->setAttribute ("outYou", profileToString (p.outYou));
+            e->setAttribute ("outYouM", measurementsToString (p.outYouM));
+        }
     }
 }
 
@@ -886,6 +1174,8 @@ void GroundShakeProcessor::loadPhase3 (const juce::XmlElement& xml)
     learnedBars = xml.getIntAttribute ("learnedBars", 0);
     learnOriginPpq.store ((originBar - 1) * 4.0);
     followPlayhead = xml.getBoolAttribute ("followPlayhead", true);
+    alignOffsetBars = xml.getDoubleAttribute ("alignOffsetBars", 0.0);
+    viewMode = (ViewMode) juce::jlimit (0, 2, xml.getIntAttribute ("viewMode", (int) ViewMode::out));
     const int wantSlot = juce::jlimit (0, 1, xml.getIntAttribute ("activeSlot", 0));
     activeSlot = wantSlot;
     ovMin.clear();
@@ -929,9 +1219,15 @@ void GroundShakeProcessor::loadPhase3 (const juce::XmlElement& xml)
             p.refM = stringToMeasurements (e->getStringAttribute ("refM"));
             p.analyzed = p.you.valid && p.ref.valid;
         }
+        if (p.analyzed && e->hasAttribute ("outYou"))
+        {
+            p.outYou = stringToProfile (e->getStringAttribute ("outYou"));
+            p.outYouM = stringToMeasurements (e->getStringAttribute ("outYouM"));
+            p.outValid = p.outYou.valid && p.correctionOn();
+        }
         pairs.push_back (p);
     }
-    for (int i = 0; i < (int) pairs.size(); ++i) refreshPairCoach (pairs[(size_t) i], i);
+    for (int i = 0; i < (int) pairs.size(); ++i) { refreshPairCoach (pairs[(size_t) i], i); refreshOutCoach (pairs[(size_t) i], i); }
     selectedPair = juce::jlimit (-1, (int) pairs.size() - 1, xml.getIntAttribute ("selectedPair", -1));
     pushCorrectionTable();
 
@@ -947,4 +1243,273 @@ void GroundShakeProcessor::loadPhase3 (const juce::XmlElement& xml)
             loadReferenceAsync (f, slot);
         }
     }
+}
+
+//==============================================================================
+//  Phase 4: master bus check. Your drop against the reference's drop, measured the same
+//  way at the learned rate: tone balance, width, low-end mono, squash and loudness.
+//  Advice only: these are changes for your master chain, before Ground Shake.
+//==============================================================================
+namespace
+{
+    juce::String db1 (float v) { return (v >= 0 ? "+" : "") + juce::String (v, 1) + " dB"; }
+    float half (float v) { return std::round (v * 2.0f) / 2.0f; }
+
+    void buildMasterReport (const gs::Measurements& y, const gs::Measurements& r, const Spread& ys, const Spread& rs,
+                            int yourBar, int refBar, int bars, const juce::String& refName, gs::Coach& out)
+    {
+        using B = gs::Measurements::Band;
+        std::vector<gs::CheckRow> rows;
+        std::vector<gs::FixCard> cards;
+        const juce::String comparing = "Your drop (Ableton bars " + juce::String (yourBar) + "-" + juce::String (yourBar + bars - 1)
+                                       + ") against " + refName + "'s drop (bars " + juce::String (refBar) + "-"
+                                       + juce::String (refBar + bars - 1) + "), level-matched.";
+        auto card = [&] (gs::CheckId id, gs::Status sev, const juce::String& title, const juce::String& headline)
+        {
+            gs::FixCard c;
+            c.id = id;  c.severity = sev;  c.title = title;  c.headline = headline;
+            c.comparing = comparing;
+            c.adviceOnly = true;
+            c.fixed = "Advice for your master chain: put these before your limiter, with Ground Shake last.";
+            return c;
+        };
+        auto statusOf = [] (float a, float nearAt, float failAt)
+        { return a >= failAt ? gs::Status::fail : (a >= nearAt ? gs::Status::near : gs::Status::pass); };
+
+        // ---- tone balance (above the low end: the pairs look after the sub and kick)
+        {
+            // each band's share of everything above 120 Hz, so a heavier or lighter low end (the pairs'
+            // job) doesn't read as a tone difference up top
+            auto rel = [] (const gs::Measurements& m, int band)
+            {
+                double above = 0;
+                for (int b : { (int) B::bBody, (int) B::bMid, (int) B::bHigh }) above += std::pow (10.0, m.bandDb[(size_t) b] / 10.0);
+                return (float) (m.bandDb[(size_t) band] - 10.0 * std::log10 (std::max (1.0e-12, above)));
+            };
+            const float dBody = rel (y, B::bBody) - rel (r, B::bBody);
+            const float dMid  = rel (y, B::bMid)  - rel (r, B::bMid);
+            const float dHigh = rel (y, B::bHigh) - rel (r, B::bHigh);
+            struct Bd { const char* name; const char* range; float d; float hz; };
+            Bd bands[] = { { "highs", "2-7 kHz", dHigh, 4000.0f }, { "mids", "300 Hz-2 kHz", dMid, 900.0f }, { "low-mids", "120-300 Hz", dBody, 200.0f } };
+            const Bd* worst = &bands[0];
+            for (auto& b : bands) if (std::abs (b.d) > std::abs (worst->d)) worst = &b;
+            const auto st = statusOf (std::abs (worst->d), 1.5f, 3.0f);
+            rows.push_back ({ gs::CheckId::masterTone, gs::checkName (gs::CheckId::masterTone), st,
+                              juce::String (worst->name) + " " + db1 (worst->d) });
+            if (st != gs::Status::pass)
+            {
+                auto c = card (gs::CheckId::masterTone, st, "MASTER TONE: " + juce::String (worst->name).toUpperCase() + (worst->d < 0 ? " LOW" : " HIGH"),
+                               "Your " + juce::String (worst->name) + " (" + worst->range + ") sit " + db1 (worst->d) + " against the reference");
+                c.see = "Balance above 120 Hz, you vs reference: low-mids " + db1 (dBody) + ", mids " + db1 (dMid)
+                        + ", highs " + db1 (dHigh) + ".";
+                c.cause = worst->d < 0 ? "The mix is darker or thinner there than the reference, so the drop sounds duller next to it in a DJ set."
+                                       : "The mix has more there than the reference, so the drop can sound harsh or boxy next to it.";
+                for (auto& b : bands)
+                {
+                    if (std::abs (b.d) < 1.5f) continue;
+                    const float g = juce::jlimit (0.5f, 3.0f, half (std::abs (b.d) * 0.6f));
+                    const juce::String hz = b.hz >= 1000 ? juce::String (b.hz / 1000.0f, 1) + " kHz" : juce::String ((int) b.hz) + " Hz";
+                    if (b.d < 0)
+                        c.how.add ("On your master EQ (e.g. Pro-Q 4), before the limiter: a wide bell (Q 0.5-0.7) +" + juce::String (g, 1)
+                                   + " dB at " + hz + (b.hz >= 4000 ? ", or a gentle high shelf from 3 kHz." : "."));
+                    else
+                        c.how.add ("On your master EQ, before the limiter: a wide bell -" + juce::String (g, 1) + " dB at " + hz
+                                   + (b.hz >= 4000 ? ". If it's harsh rather than just bright, soothe3 on the master tames it more gently." : "."));
+                }
+                c.how.add ("Start at about half the gap and listen: EQ on the master moves everything, so small moves go a long way.");
+                c.worked = "This row goes green after you re-learn (or play the drop in Ableton with the MASTER view open).";
+                c.tooFar = "If the reading flips the other way, or the drop starts to sound thin or brittle, back off.";
+                c.watch = "If one sound causes it (a bright hat, a boxy synth), fixing that channel beats EQ on the whole master.";
+                cards.push_back (c);
+            }
+        }
+
+        // ---- stereo width above 300 Hz
+        if (ys.valid && rs.valid)
+        {
+            const float yw = std::max (-40.0f, ys.sideHighDb), rw = std::max (-40.0f, rs.sideHighDb);   // below -40 dB is mono
+            const float d = yw - rw;
+            const auto st = statusOf (std::abs (d), 3.0f, 6.0f);
+            rows.push_back ({ gs::CheckId::masterWidth, gs::checkName (gs::CheckId::masterWidth), st,
+                              std::abs (d) < 0.5f ? juce::String ("matched") : db1 (d) + (d < 0 ? " narrow" : " wide") });
+            if (st != gs::Status::pass)
+            {
+                auto c = card (gs::CheckId::masterWidth, st, d < 0 ? "MASTER IS NARROWER" : "MASTER IS WIDER",
+                               "Side vs centre above 300 Hz: " + db1 (d) + " against the reference");
+                auto wtxt = [] (float v) { return v <= -40.0f ? juce::String ("mono") : db1 (v) + " against the centre"; };
+                c.see = "Your sides above 300 Hz: " + wtxt (yw) + "; the reference: " + wtxt (rw) + ".";
+                if (d < 0)
+                {
+                    c.cause = "Less going on in the sides, so the drop feels smaller than the reference on a big system.";
+                    c.how.add ("On your master, before the limiter: a stereo imager (e.g. Ozone 12 Imager) with the bands above 300 Hz widened. Start around +15-20% and compare.");
+                    c.how.add ("Keep the low band (below 120-200 Hz) at 0% or narrower: width goes in the top, never the sub.");
+                    c.how.add ("Better still, widen the sounds that should be wide (pads, chords, FX returns) on their own channels.");
+                }
+                else
+                {
+                    c.cause = "More in the sides than the reference. Clubs often play mono or near-mono, and very wide parts can drop out or feel hollow.";
+                    c.how.add ("On your master imager, narrow the bands above 300 Hz a little (-10 to -15%) and compare.");
+                    c.how.add ("Check the drop in mono (Ableton Utility on the master, Width 0%): anything that vanishes is too wide on its own channel.");
+                }
+                c.tooFar = "If the centre (kick, bass, lead) starts to feel weaker, you've widened too much.";
+                c.watch = "Wideners can upset mono. Check in mono after every change.";
+                cards.push_back (c);
+            }
+        }
+
+        // ---- low end mono
+        if (y.valid)
+        {
+            const float mc = y.monoCorr;
+            const auto st = mc < 0.8f ? gs::Status::fail : (mc < 0.9f ? gs::Status::near : gs::Status::pass);
+            rows.push_back ({ gs::CheckId::masterLowMono, gs::checkName (gs::CheckId::masterLowMono), st,
+                              juce::String (mc, 2) + (st == gs::Status::pass ? " mono" : " wide") });
+            if (st != gs::Status::pass)
+            {
+                auto c = card (gs::CheckId::masterLowMono, st, "LOW END NOT MONO", "Below 120 Hz your left and right differ (" + juce::String (mc, 2) + "; 1.00 is mono)");
+                c.see = "Correlation of left and right below 120 Hz: " + juce::String (mc, 2) + " (reference " + juce::String (r.monoCorr, 2) + ").";
+                c.cause = "Stereo sub or bass loses power on mono club systems and can cancel itself out.";
+                c.how.add ("On your master: Ozone 12 Imager with the low band (up to 120 Hz) at -100% (mono), or Ozone Low End Focus / Bass Control.");
+                c.how.add ("Find the source: a stereo bass patch (unison, chorus) or reverb on the bass. Make that channel mono below 120 Hz.");
+                c.how.add ("Per section, Ground Shake's MONO button does the same thing in a pair's correction.");
+                c.tooFar = "Mono below 120 Hz can't go too far; just don't push the crossover much above 150-200 Hz.";
+                cards.push_back (c);
+            }
+        }
+
+        // ---- squash: whole-band crest (peak over RMS), plus the sub's own peaks
+        if (ys.valid && rs.valid)
+        {
+            const float d = ys.crestDb - rs.crestDb;
+            const float dSub = y.subCrestDb - r.subCrestDb;
+            const auto st = d <= -3.0f ? gs::Status::fail : (d <= -1.5f || dSub <= -3.0f ? gs::Status::near : gs::Status::pass);
+            rows.push_back ({ gs::CheckId::masterSquash, gs::checkName (gs::CheckId::masterSquash), st,
+                              "crest " + db1 (d) });
+            if (st != gs::Status::pass)
+            {
+                auto c = card (gs::CheckId::masterSquash, st, "MASTER SQUASHED MORE",
+                               "Peaks over average: " + db1 (d) + " against the reference" + (dSub <= -3.0f ? " (sub peaks " + db1 (dSub) + ")" : juce::String()));
+                c.see = "Crest (peak over RMS) in the drop: you " + juce::String (ys.crestDb, 1) + " dB, reference " + juce::String (rs.crestDb, 1)
+                        + " dB. Sub peaks: " + db1 (dSub) + ".";
+                c.cause = "Your limiter (or clipper) is working harder, so the kick has less room to hit. On a club system that reads as smaller, not louder.";
+                c.how.add ("On your limiter (e.g. Pro-L 2): lower the gain by about " + juce::String (juce::jlimit (0.5f, 4.0f, half (-d)), 1) + " dB and compare level-matched.");
+                c.how.add ("Try a cleaner style (Transparent or Modern) and a slightly slower release.");
+                if (dSub <= -3.0f)
+                    c.how.add ("The sub is losing its peaks: ease the sub into the limiter (a little less sub before it, or a gentle clipper before the limiter) so the limiter isn't driven by the low end.");
+                c.worked = "Crest within 1.5 dB of the reference. rekordbox Auto Gain levels the loudness anyway, so the punch is what's left.";
+                c.tooFar = "If you end up more than 2-3 dB quieter than the reference, the trim in rekordbox has to work harder; meet in the middle.";
+                cards.push_back (c);
+            }
+            else if (d >= 3.0f)
+            {
+                auto c = card (gs::CheckId::masterSquash, gs::Status::info, "ROOM TO PUSH",
+                               "Your peaks stand " + db1 (d) + " further out than the reference's");
+                c.see = "Crest in the drop: you " + juce::String (ys.crestDb, 1) + " dB, reference " + juce::String (rs.crestDb, 1) + " dB.";
+                c.cause = "Your master is more open than the reference. That's fine, but you have room to get louder before it gets squashed.";
+                c.how.add ("If you want to match its level: raise your limiter's gain by 1 dB at a time, stopping before the crest drops below the reference's.");
+                cards.push_back (c);
+            }
+        }
+
+        // ---- loudness of the drop
+        if (y.valid && r.valid && y.lufs > -60.0f && r.lufs > -60.0f)
+        {
+            const float d = y.lufs - r.lufs;
+            const auto st = std::abs (d) >= 1.0f ? gs::Status::near : gs::Status::pass;
+            rows.push_back ({ gs::CheckId::masterLoudness, gs::checkName (gs::CheckId::masterLoudness), st,
+                              (d >= 0 ? "+" : "") + juce::String (d, 1) + " LU" });
+            if (st != gs::Status::pass)
+            {
+                auto c = card (gs::CheckId::masterLoudness, gs::Status::near, d < 0 ? "DROP IS QUIETER" : "DROP IS LOUDER",
+                               "Drop loudness " + juce::String (d, 1) + " LU against the reference");
+                c.see = "Drop loudness: you " + juce::String (y.lufs, 1) + " LUFS, reference " + juce::String (r.lufs, 1) + " LUFS (measured the same way, so the difference is what counts).";
+                c.cause = "rekordbox Auto Gain evens this out when you play, which is why the trim moves. It matters less than the squash and tone above.";
+                if (d < 0)
+                    c.how.add (ys.valid && rs.valid && ys.crestDb > rs.crestDb + 1.0f
+                                   ? "You have peak room: raise your limiter's gain by about " + juce::String (juce::jlimit (0.5f, 4.0f, half (-d)), 1) + " dB."
+                                   : "You're already as squashed as the reference: don't push the limiter. Close the gap with tone (the highs card) and arrangement instead.");
+                else
+                    c.how.add ("Lower your limiter's gain by about " + juce::String (juce::jlimit (0.5f, 4.0f, half (d)), 1) + " dB: the kick gets back room to hit.");
+                c.how.add ("Fix tone and squash first; then set the level.");
+                cards.push_back (c);
+            }
+        }
+
+        // ---- chain order (always, information)
+        {
+            auto c = card (gs::CheckId::masterChain, gs::Status::info, "MASTER CHAIN ORDER", "Where each change goes on your master");
+            c.comparing = {};
+            c.how.add ("Master EQ (tone): first.");
+            c.how.add ("Stereo imager (width, low end mono): after the EQ.");
+            c.how.add ("Glue compressor if you use one, then the limiter (e.g. Pro-L 2).");
+            c.how.add ("Ground Shake last, after the limiter: its corrections and safety ceiling follow your limiter's peak level.");
+            c.watch = "Re-learn after changing the master, so the pairs and this check measure the new sound.";
+            cards.push_back (c);
+        }
+
+        // fix order: the first real problem gets the "fix this first" tag
+        for (auto& c : cards) if (c.severity == gs::Status::fail || c.severity == gs::Status::near) { c.fixFirst = true; break; }
+        int scored = 0;
+        float sum = 0;
+        int fails = 0, nears = 0;
+        for (auto& rw : rows)
+        {
+            ++scored;
+            sum += rw.status == gs::Status::pass ? 1.0f : (rw.status == gs::Status::near ? 0.5f : 0.0f);
+            fails += rw.status == gs::Status::fail ? 1 : 0;
+            nears += rw.status == gs::Status::near ? 1 : 0;
+        }
+        const float pct = scored > 0 ? 100.0f * sum / (float) scored : -1.0f;
+        const juce::String line = fails + nears == 0 ? "Master: your drop matches the reference's tone, width, squash and loudness."
+                                : "Master: " + juce::String (fails) + " to fix, " + juce::String (nears) + " close (your drop vs the reference's drop).";
+        out.setReport (std::move (rows), std::move (cards), pct, line);
+    }
+}
+
+void GroundShakeProcessor::runMasterCheck()
+{
+    masterPending = false;
+    auto lt = learnedTrack;
+    auto rt = reference;
+    if (lt == nullptr || rt == nullptr || learnBpm <= 0 || bpm <= 0) return;
+    masterRunning = true;
+    auto flag = alive;
+    const double lb = learnBpm, rb = bpm, ro = gridOffsetSec;
+    const float sp = split;
+    const int startBar = getEffectiveStartBar();
+    pool.addJob ([this, flag, lt, rt, lb, rb, ro, sp, startBar]
+    {
+        const double lsr = lt->sampleRate, barL = 240.0 / lb, barR = 240.0 / rb;
+        const int bars = juce::jlimit (1, gs::kBars, gs::numBarsInReference (*lt, lb, 0.0));
+        const int yDrop = gs::findDropBar (*lt, lb, 0.0, bars);
+        const int rDrop = gs::findDropBar (*rt, rb, ro, bars);
+        const int ys0 = (int) (yDrop * barL * lsr), yn = (int) (bars * barL * lsr);
+        auto yM = gs::measureAudio (lt->audio, ys0, yn, lsr, 0.0, barL / 4.0 * lsr, sp);
+        auto yS = measureSpread (lt->audio, ys0, yn, lsr);
+        const auto w = windowAtRate (*rt, (int) ((rt->firstDownbeatSec + ro + rDrop * barR) * rt->sampleRate),
+                                     (int) (bars * barR * rt->sampleRate), lsr);
+        gs::Measurements rM;
+        Spread rS;
+        if (w.getNumSamples() > 0)
+        {
+            rM = gs::measureAudio (w, 0, w.getNumSamples(), lsr, 0.0, barR / 4.0 * lsr, sp);
+            rS = measureSpread (w, 0, w.getNumSamples(), lsr);
+        }
+        auto report = std::make_shared<gs::Coach>();
+        if (yM.valid && rM.valid)
+            buildMasterReport (yM, rM, yS, rS, startBar + yDrop, rDrop + 1, bars, rt->name, *report);
+        juce::MessageManager::callAsync ([this, flag, report, ok = yM.valid && rM.valid, lt, rt]
+        {
+            if (! flag->load()) return;
+            masterRunning = false;
+            if (learnedTrack != lt || reference != rt) { masterPending = learnedTrack != nullptr && reference != nullptr; return; }
+            if (ok) { masterCoach = *report; masterValid = true; }
+            if (onReferenceChanged) onReferenceChanged();
+        });
+    });
+}
+
+void GroundShakeProcessor::runQueuedWorkNow()
+{
+    timerCallback();
 }

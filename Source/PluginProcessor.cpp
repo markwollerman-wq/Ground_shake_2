@@ -73,7 +73,7 @@ bool GroundShakeProcessor::isBusesLayoutSupported (const BusesLayout& layouts) c
     return layouts.getMainInputChannelSet() == out;
 }
 
-void GroundShakeProcessor::prepareToPlay (double sampleRate, int)
+void GroundShakeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     {
         const juce::ScopedLock al (ringAllocLock);
@@ -89,6 +89,8 @@ void GroundShakeProcessor::prepareToPlay (double sampleRate, int)
     currentSplit = splitParam.load();
     splitter.prepare (sampleRate, currentSplit);
     matchStage.prepare (sampleRate);
+    preL.assign ((size_t) juce::jmax (8192, samplesPerBlock * 2), 0.0f);
+    preR.assign (preL.size(), 0.0f);
     meter.reset();
     subPow = 0.0f;
     abFade = 0.0f;
@@ -186,13 +188,19 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
                     if (ppq >= e.startPpq && ppq < e.endPpq) { target = e.s;  act = e.active;  lm = e.levelMatch;  break; }
         }
         target.split = currentSplit;
+        if (meterBeforeCorrection.load() && (size_t) n <= preL.size())
+        {
+            std::copy (wL, wL + n, preL.data());
+            std::copy (wR, wR + n, preR.data());
+        }
         matchStage.process (wL, wR, n, target, act, lm, startSteps, stepsPerSample, 60.0 / bpmNow * sr);
         ceilingDb.store (matchStage.ceilingDb());
     }
 
     // --- analyse YOUR mix (what leaves the plugin, before the A/B swap)
-    const float* L = buffer.getReadPointer (0);
-    const float* R = buffer.getReadPointer (numCh > 1 ? 1 : 0);
+    const bool usePre = meterBeforeCorrection.load() && (size_t) n <= preL.size();
+    const float* L = usePre ? preL.data() : buffer.getReadPointer (0);       // MIX: before the correction
+    const float* R = usePre ? preR.data() : buffer.getReadPointer (numCh > 1 ? 1 : 0);
     const float subCoef = (float) std::exp (-1.0 / (0.03 * sr));     // ~30 ms for the shake
     const double msCoef = std::exp (-1.0 / (3.0 * sr));              // ~3 s for loudness
     const bool ringOk = ringSize > 0 && (int) ringL.size() == ringSize;
@@ -484,18 +492,8 @@ void GroundShakeProcessor::setWindowStartBar (int bar)
 {
     windowStartBar = bar;
     rebuildWindow();
-    // moving the reference window while a pair is selected re-points that pair
-    if (! switchingForPair && selectedPair >= 0 && selectedPair < (int) pairs.size())
-    {
-        auto& p = pairs[(size_t) selectedPair];
-        if (p.refStart != windowStartBar || p.slot != activeSlot)
-        {
-            p.refStart = windowStartBar;
-            p.slot = activeSlot;
-            if (std::find (pairsToAnalyze.begin(), pairsToAnalyze.end(), selectedPair) == pairsToAnalyze.end())
-                pairsToAnalyze.push_back (selectedPair);
-        }
-    }
+    // Phase 4: moving the window never changes a pair (use EDIT PAIR); it just lets go of it
+    deselectForWindowChange();
     if (onReferenceChanged) onReferenceChanged();
 }
 
@@ -537,14 +535,7 @@ void GroundShakeProcessor::setWindowBars (int bars, bool fromLoop)
     else if (wasBreak && breakdownBar >= 0) windowStartBar = breakdownBar;
     coach.reset();
     rebuildWindow();
-    if (! switchingForPair && selectedPair >= 0 && selectedPair < (int) pairs.size())
-    {
-        auto& p = pairs[(size_t) selectedPair];
-        p.refBars = windowBars;
-        p.refStart = windowStartBar;
-        if (std::find (pairsToAnalyze.begin(), pairsToAnalyze.end(), selectedPair) == pairsToAnalyze.end())
-            pairsToAnalyze.push_back (selectedPair);
-    }
+    deselectForWindowChange();
     if (onReferenceChanged) onReferenceChanged();
 }
 
@@ -749,8 +740,10 @@ void GroundShakeProcessor::computeMatch()
         auto& p = pairs[(size_t) selectedPair];
         if (! p.analyzed) return;
         p.corr = autoCorrection (p);
+        p.corrAuto = true;
         if (p.state != MatchState::applied) p.state = MatchState::ready;
         refreshPairCoach (p, selectedPair);
+        if (p.correctionOn()) requestSimulation (selectedPair);
         pushCorrectionTable();
         return;
     }
@@ -787,6 +780,7 @@ void GroundShakeProcessor::setMatchPreview (bool on)
         auto& p = pairs[(size_t) selectedPair];
         if (on && p.state == MatchState::ready) p.state = MatchState::preview;
         else if (! on && p.state == MatchState::preview) p.state = MatchState::ready;
+        if (p.correctionOn()) requestSimulation (selectedPair); else p.outValid = false;
         pushCorrectionTable();
         return;
     }
@@ -802,6 +796,7 @@ void GroundShakeProcessor::applyMatch()
         auto& p = pairs[(size_t) selectedPair];
         if (p.state == MatchState::ready || p.state == MatchState::preview) p.state = MatchState::applied;
         refreshPairCoach (p, selectedPair);
+        requestSimulation (selectedPair);
         pushCorrectionTable();
         return;
     }
@@ -817,6 +812,8 @@ void GroundShakeProcessor::revertMatch()
         auto& p = pairs[(size_t) selectedPair];
         p.corr = {};
         p.state = MatchState::off;
+        p.outValid = false;
+        p.outStatus = 0;
         refreshPairCoach (p, selectedPair);
         pushCorrectionTable();
         return;
@@ -958,6 +955,41 @@ void GroundShakeProcessor::timerCallback()
         analyzePair (i);
     }
 
+    // OUT readouts: run each pair's correction over its learned audio (one job at a time, debounced)
+    if (simRunning == 0 && pairAnalysisRunning == 0 && pairsToAnalyze.empty() && ! pairsToSimulate.empty()
+        && (juce::int32) (now - simDue) >= 0)
+    {
+        const int i = pairsToSimulate.front();
+        pairsToSimulate.erase (pairsToSimulate.begin());
+        simulatePair (i);
+    }
+    if (simSummaryPending && simRunning == 0 && pairsToSimulate.empty() && pairAnalysisRunning == 0 && pairsToAnalyze.empty())
+    {
+        simSummaryPending = false;
+        int og = 0, oa = 0, orr = 0, ma = 0, mr = 0, on = 0;
+        for (auto& q : pairs)
+        {
+            ma += q.status == 2 ? 1 : 0;  mr += q.status == 3 ? 1 : 0;
+            if (q.correctionOn() && q.outValid)
+            { ++on; og += q.outStatus == 1 ? 1 : 0; oa += q.outStatus == 2 ? 1 : 0; orr += q.outStatus == 3 ? 1 : 0; }
+        }
+        if (on > 0)
+            learnMessage = juce::String ((int) pairs.size()) + " pairs. OUT (with Ground Shake): " + juce::String (og) + " green, "
+                           + juce::String (oa) + " amber, " + juce::String (orr) + " red.  MIX (your mix alone): "
+                           + juce::String (ma) + " amber, " + juce::String (mr) + " red.";
+        if (onReferenceChanged) onReferenceChanged();
+    }
+    // master bus check: whenever the learned track or the reference on show changes
+    if (reference.get() != masterRefSeen || learnedTrack.get() != masterLtSeen)
+    {
+        masterRefSeen = reference.get();
+        masterLtSeen = learnedTrack.get();
+        masterValid = false;
+        masterPending = reference != nullptr && learnedTrack != nullptr;
+    }
+    if (masterPending && ! masterRunning && learnState == LearnState::off) runMasterCheck();
+
+    meterBeforeCorrection.store (viewMode == ViewMode::mix && ! pairs.empty());
     if (++timerTicks % 3 == 0) updateCoach();
 }
 

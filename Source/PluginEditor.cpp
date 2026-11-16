@@ -439,7 +439,8 @@ void StepGridView::paint (juce::Graphics& g)
 }
 
 //==============================================================================
-//  Arrangement: the reference on top, your learned track below, pairs in colour
+//  Arrangement: the reference on top, your learned track below, on one shared bar
+//  timeline (Phase 4), pairs in colour. Wheel to zoom, NUDGE to line your track up.
 //==============================================================================
 juce::Colour ArrangementView::pairColour (int index)
 {
@@ -447,20 +448,107 @@ juce::Colour ArrangementView::pairColour (int index)
     return juce::Colour (c[((index % 8) + 8) % 8]);
 }
 
-float ArrangementView::xForTime (double sec) const
+ArrangementView::ArrangementView (GroundShakeProcessor& p) : proc (p)
 {
-    auto* ref = proc.getReference();
-    auto a = refLane();
-    if (ref == nullptr) return a.getX();
-    return a.getX() + (float) (sec / ref->lengthSeconds()) * a.getWidth();
+    setWantsKeyboardFocus (true);
+    for (auto* b : { &nudgeL, &nudgeR, &nudgeZero, &zoomOut, &zoomIn, &zoomFit, &nextButton, &cancelButton })
+        addAndMakeVisible (*b);
+    auto nudge = [this] (double dir)
+    {
+        const double step = juce::ModifierKeys::currentModifiers.isShiftDown() ? 0.25 : 1.0;   // shift: one beat
+        proc.setAlignOffsetBars (proc.getAlignOffsetBars() + dir * step);
+        repaint();
+    };
+    nudgeL.onClick = [nudge] { nudge (-1.0); };
+    nudgeR.onClick = [nudge] { nudge (1.0); };
+    nudgeZero.onClick = [this] { proc.setAlignOffsetBars (0.0); repaint(); };
+    nudgeL.setTooltip ("Move your track one bar left (Shift: one beat). Only the view moves: pairs and the export stay on your real bars.");
+    nudgeR.setTooltip ("Move your track one bar right (Shift: one beat). Only the view moves: pairs and the export stay on your real bars.");
+    nudgeZero.setTooltip ("Line your song start up with the reference's first bar again");
+    zoomOut.onClick = [this] { zoomBy (1.6, songLane().getCentreX()); };
+    zoomIn.onClick = [this] { zoomBy (1.0 / 1.6, songLane().getCentreX()); };
+    zoomFit.onClick = [this] { zoomToFit(); };
+    zoomIn.setTooltip ("Zoom in (or scroll the mouse wheel / pinch over the waveforms)");
+    zoomFit.setTooltip ("Show both whole tracks");
+    nextButton.onClick = [this]
+    {
+        if (step == Step::song)
+        {
+            if (draftA < 0 && editIndex >= 0 && editIndex < (int) proc.getPairs().size())
+            {
+                draftA = proc.getPairs()[(size_t) editIndex].songStart;
+                draftB = proc.getPairs()[(size_t) editIndex].songEnd;
+            }
+            if (draftA >= 0 && draftB > draftA) { step = Step::ref; refA = refB = -1; }
+        }
+        else if (step == Step::ref)
+        {
+            if (editIndex >= 0 && editIndex < (int) proc.getPairs().size())
+            {
+                const auto& p = proc.getPairs()[(size_t) editIndex];
+                if (p.slot == proc.getActiveSlot()) { finishPairing (p.refStart, p.refBars); return; }
+            }
+            finishPairing (proc.getWindowStartBar(), proc.getWindowBars());      // the red window
+            return;
+        }
+        refreshButtons();
+        repaint();
+        if (onPairingChanged) onPairingChanged();
+    };
+    cancelButton.onClick = [this] { cancelPairing(); };
+    refreshButtons();
 }
 
-double ArrangementView::timeForX (float x) const
+void ArrangementView::resized()
+{
+    const int y = 140;
+    nudgeL.setBounds (66, y, 24, 20);
+    nudgeR.setBounds (92, y, 24, 20);
+    nudgeZero.setBounds (118, y, 22, 20);
+    nextButton.setBounds (560, y, 96, 20);
+    cancelButton.setBounds (660, y, 76, 20);
+    zoomOut.setBounds (getWidth() - 136, y, 24, 20);
+    zoomIn.setBounds (getWidth() - 110, y, 24, 20);
+    zoomFit.setBounds (getWidth() - 84, y, 44, 20);
+}
+
+void ArrangementView::refreshButtons()
+{
+    const bool pairing = step != Step::none;
+    for (auto* b : { &nudgeL, &nudgeR, &nudgeZero }) b->setVisible (! pairing);
+    nextButton.setVisible (pairing);
+    cancelButton.setVisible (pairing);
+    const bool editing = editIndex >= 0;
+    if (step == Step::song)
+    {
+        nextButton.setButtonText (editing && draftA < 0 ? "KEEP BARS" : "NEXT");
+        nextButton.setEnabled ((draftA >= 0 && draftB > draftA) || editing);
+    }
+    else if (step == Step::ref)
+    {
+        bool keep = false;
+        if (editing && editIndex < (int) proc.getPairs().size()) keep = proc.getPairs()[(size_t) editIndex].slot == proc.getActiveSlot();
+        nextButton.setButtonText (keep ? "KEEP BARS" : "USE WINDOW");
+        nextButton.setEnabled (proc.getReference() != nullptr);
+    }
+}
+
+//------------------------------------------------------------------------------
+double ArrangementView::refBarSec() const
+{
+    const double b = proc.getBpm();
+    return 240.0 / (b > 1.0 ? b : 120.0);
+}
+double ArrangementView::refT0() const
+{
+    if (proc.getReference() == nullptr) return 0.0;
+    return -proc.getGridStartSec() / refBarSec();
+}
+double ArrangementView::refT1() const
 {
     auto* ref = proc.getReference();
-    auto a = refLane();
     if (ref == nullptr) return 0.0;
-    return (x - a.getX()) / a.getWidth() * ref->lengthSeconds();
+    return (ref->lengthSeconds() - proc.getGridStartSec()) / refBarSec();
 }
 
 int ArrangementView::songBarsShown() const
@@ -470,16 +558,66 @@ int ArrangementView::songBarsShown() const
     return n;
 }
 
-float ArrangementView::xForBar (double bar) const
+void ArrangementView::currentView (double& start, double& bars) const
 {
-    auto a = songLane();
-    return a.getX() + (float) (bar / songBarsShown()) * a.getWidth();
+    if (! fit) { start = viewStart; bars = viewBars; return; }
+    double t0 = songT0(), t1 = songT0() + songBarsShown();
+    if (proc.getReference() != nullptr) { t0 = std::min (t0, refT0()); t1 = std::max (t1, refT1()); }
+    start = t0;
+    bars = juce::jmax (4.0, t1 - t0);
 }
 
-double ArrangementView::barForX (float x) const
+float ArrangementView::xForT (double t) const
 {
+    double vs, vb;
+    currentView (vs, vb);
     auto a = songLane();
-    return (x - a.getX()) / a.getWidth() * songBarsShown();
+    return a.getX() + (float) ((t - vs) / vb) * a.getWidth();
+}
+
+double ArrangementView::tForX (float x) const
+{
+    double vs, vb;
+    currentView (vs, vb);
+    auto a = songLane();
+    return vs + (x - a.getX()) / a.getWidth() * vb;
+}
+
+void ArrangementView::zoomBy (double factor, float aroundX)
+{
+    double vs, vb;
+    currentView (vs, vb);
+    double full0 = songT0(), full1 = songT0() + songBarsShown();
+    if (proc.getReference() != nullptr) { full0 = std::min (full0, refT0()); full1 = std::max (full1, refT1()); }
+    const double tAt = tForX (aroundX);
+    const double nb = juce::jlimit (0.5, juce::jmax (4.0, (full1 - full0) * 1.5), vb * factor);
+    const double frac = (aroundX - songLane().getX()) / songLane().getWidth();
+    viewStart = tAt - frac * nb;
+    viewBars = nb;
+    fit = false;
+    repaint();
+}
+
+void ArrangementView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
+{
+    double vs, vb;
+    currentView (vs, vb);
+    const bool scroll = std::abs (w.deltaX) > std::abs (w.deltaY) || e.mods.isShiftDown();
+    if (scroll)
+    {
+        const float d = std::abs (w.deltaX) > std::abs (w.deltaY) ? w.deltaX : w.deltaY;
+        viewStart = vs - d * vb * 0.4;
+        viewBars = vb;
+        fit = false;
+        repaint();
+    }
+    else if (w.deltaY != 0.0f)
+        zoomBy (std::exp (-w.deltaY * 1.2), e.position.x);
+}
+
+void ArrangementView::mouseMagnify (const juce::MouseEvent& e, float scale)
+{
+    if (scale > 0.0f) zoomBy (1.0 / scale, e.position.x);
 }
 
 int ArrangementView::pairAt (float x, int& edge) const
@@ -496,15 +634,85 @@ int ArrangementView::pairAt (float x, int& edge) const
     return -1;
 }
 
-bool ArrangementView::getDraft (int& a, int& b) const
+//------------------------------------------------------------------------------
+//  Waveforms: the overview when zoomed out, the audio itself when zoomed in
+void ArrangementView::drawLaneWave (juce::Graphics& g, juce::Rectangle<float> lane, bool reference, float wx0, float wx1,
+                                    juce::Colour inside, juce::Colour outside)
 {
-    if (draftA < 0 || draftB <= draftA) return false;
-    a = draftA;  b = draftB;
-    return true;
+    const gs::ReferenceTrack* tr = reference ? proc.getReference() : proc.getLearnedTrack();
+    const std::vector<float>* mn = nullptr;
+    const std::vector<float>* mx = nullptr;
+    double pointsPerBar = 0, firstPointT = 0;          // overview points, placed on the timeline
+    double samplesPerBar = 0, firstSampleT = 0;
+    if (reference)
+    {
+        if (tr == nullptr || tr->overviewMin.empty()) return;
+        mn = &tr->overviewMin;  mx = &tr->overviewMax;
+        pointsPerBar = (double) mn->size() / tr->lengthSeconds() * refBarSec();
+        firstPointT = refT0();
+        samplesPerBar = tr->sampleRate * refBarSec();
+        firstSampleT = refT0();
+    }
+    else
+    {
+        mn = &proc.getLearnedOverviewMin();  mx = &proc.getLearnedOverviewMax();
+        if (mn->empty()) return;
+        pointsPerBar = gs::SongRecorder::kOverviewPerBar;
+        firstPointT = songT0() - proc.getTrimBars();     // the overview starts at the recording origin
+        if (tr != nullptr && proc.getLearnBpm() > 0)
+        {
+            samplesPerBar = tr->sampleRate * 240.0 / proc.getLearnBpm();
+            firstSampleT = songT0();
+        }
+    }
+    // the loudness scale: the loudest overview point fills the lane
+    float peak = 1.0e-6f;
+    const size_t skip = reference ? 0 : (size_t) proc.getTrimBars() * gs::SongRecorder::kOverviewPerBar;
+    for (size_t i = skip; i < mn->size(); ++i) peak = std::max ({ peak, (*mx)[i], -(*mn)[i] });
+    const float mid = lane.getCentreY(), half = lane.getHeight() * 0.44f / peak;
+    const int nPts = (int) mn->size();
+
+    const int px0 = (int) lane.getX(), px1 = (int) lane.getRight();
+    for (int px = px0; px < px1; ++px)
+    {
+        const double ta = tForX ((float) px), tb = tForX ((float) px + 1.0f);
+        float lo = 0.0f, hi = 0.0f;
+        bool any = false;
+        const double pa = (ta - firstPointT) * pointsPerBar, pb = (tb - firstPointT) * pointsPerBar;
+        if (pb - pa >= 1.0 || tr == nullptr || samplesPerBar <= 0)
+        {
+            int i0 = (int) std::floor (pa), i1 = (int) std::ceil (pb);
+            i0 = juce::jmax (0, i0);
+            i1 = juce::jmin (nPts, juce::jmax (i1, i0 + 1));
+            for (int i = i0; i < i1; ++i) { lo = any ? std::min (lo, (*mn)[(size_t) i]) : (*mn)[(size_t) i]; hi = any ? std::max (hi, (*mx)[(size_t) i]) : (*mx)[(size_t) i]; any = true; }
+        }
+        else
+        {
+            const auto& a = tr->audio;
+            const int ns = a.getNumSamples();
+            int s0 = (int) std::floor ((ta - firstSampleT) * samplesPerBar), s1 = (int) std::ceil ((tb - firstSampleT) * samplesPerBar);
+            s0 = juce::jmax (0, s0);
+            s1 = juce::jmin (ns, juce::jmax (s1, s0 + 1));
+            const float* L = a.getReadPointer (0);
+            const float* R = a.getReadPointer (juce::jmin (1, a.getNumChannels() - 1));
+            for (int i = s0; i < s1; ++i)
+            {
+                const float v = 0.5f * (L[i] + R[i]);
+                lo = any ? std::min (lo, v) : v;  hi = any ? std::max (hi, v) : v;  any = true;
+            }
+        }
+        if (! any) continue;
+        g.setColour ((float) px >= wx0 && (float) px <= wx1 ? inside : outside);
+        g.drawVerticalLine (px, mid - hi * half, juce::jmax (mid - hi * half + 1.0f, mid - lo * half + 1.0f));
+    }
 }
 
 void ArrangementView::paint (juce::Graphics& g)
 {
+    double vs, vb;
+    currentView (vs, vb);
+    const float pxPerBar = songLane().getWidth() / (float) vb;
+
     // ---- title row
     auto head = getLocalBounds().toFloat().reduced (16.0f, 0.0f).withHeight (28.0f);
     g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
@@ -519,12 +727,89 @@ void ArrangementView::paint (juce::Graphics& g)
     g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
     g.drawText ("BARS", juce::Rectangle<float> (378.0f, head.getY(), 40.0f, head.getHeight()), juce::Justification::centredRight);
 
-    // ---- reference lane
-    auto a = refLane();
-    g.setColour (juce::Colour (0xff0d0d11));
-    g.fillRoundedRectangle (a, 6.0f);
     const int sel = proc.getSelectedPair();
     const auto& pairs = proc.getPairs();
+    auto a = refLane();
+    auto s = songLane();
+    const auto laneBg = juce::Colour (0xff0d0d11);
+    const auto emptyBg = juce::Colour (0xff1a1a1f);
+
+    // lanes, with the parts where a track has no audio greyed out
+    auto drawLaneBack = [&] (juce::Rectangle<float> lane, double t0, double t1, bool has)
+    {
+        g.setColour (emptyBg);
+        g.fillRoundedRectangle (lane, 6.0f);
+        if (! has) { g.setColour (laneBg); g.fillRoundedRectangle (lane, 6.0f); return; }
+        const float x0 = juce::jlimit (lane.getX(), lane.getRight(), xForT (t0));
+        const float x1 = juce::jlimit (lane.getX(), lane.getRight(), xForT (t1));
+        if (x1 > x0)
+        {
+            g.setColour (laneBg);
+            g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x0, lane.getY(), x1, lane.getBottom()));
+        }
+        // hatching on the empty parts
+        g.setColour (juce::Colours::white.withAlpha (0.035f));
+        for (float x = lane.getX() - lane.getHeight(); x < lane.getRight(); x += 9.0f)
+        {
+            juce::Line<float> ln (x, lane.getBottom(), x + lane.getHeight(), lane.getY());
+            if (x + lane.getHeight() < x0 || x > x1)
+                g.drawLine (ln, 1.0f);
+        }
+    };
+    const bool haveSong = proc.getLearnedBars() > 0 || ! proc.getLearnedOverviewMin().empty();
+    drawLaneBack (a, refT0(), refT1(), ref != nullptr && ! proc.isLoading());
+    drawLaneBack (s, songT0(), songT0() + juce::jmax (1, proc.getLearnedBars()), haveSong);
+
+    // bar grid across both lanes: bars, and beats / 16ths when zoomed in
+    {
+        int stepBars = 1;
+        while (pxPerBar * stepBars < 7.0f) stepBars *= 2;
+        const int labelStep = [&] { int l = 1; while (pxPerBar * l < 44.0f) l *= 2; return juce::jmax (l, stepBars); }();
+        const int b0 = (int) std::floor (vs), b1 = (int) std::ceil (vs + vb);
+        for (int b = b0 - (b0 % stepBars + stepBars) % stepBars; b <= b1; b += stepBars)
+        {
+            const float x = xForT (b);
+            const bool strong = b % (labelStep * 4) == 0;
+            g.setColour (juce::Colours::white.withAlpha (strong ? 0.15f : 0.06f));
+            g.drawVerticalLine ((int) x, a.getY(), a.getBottom());
+            g.drawVerticalLine ((int) x, s.getY(), s.getBottom());
+        }
+        if (pxPerBar >= 40.0f)
+        {
+            const int sub = pxPerBar >= 200.0f ? 16 : 4;
+            for (int b = b0; b <= b1; ++b)
+                for (int k = 1; k < sub; ++k)
+                {
+                    const float x = xForT (b + k / (double) sub);
+                    if (x < s.getX() || x > s.getRight()) continue;
+                    g.setColour (juce::Colours::white.withAlpha (sub == 16 && k % 4 != 0 ? 0.025f : 0.05f));
+                    g.drawVerticalLine ((int) x, a.getY(), a.getBottom());
+                    g.drawVerticalLine ((int) x, s.getY(), s.getBottom());
+                }
+        }
+        // bar numbers: the reference's own bars on top, Ableton bars below
+        g.setFont (juce::FontOptions (9.5f));
+        const int startBar = proc.getEffectiveStartBar();
+        for (int b = b0 - (b0 % labelStep + labelStep) % labelStep; b <= b1; b += labelStep)
+        {
+            const float x = xForT (b);
+            if (x < a.getX() || x > a.getRight() - 20.0f) continue;
+            g.setColour (muted.withAlpha (0.85f));
+            if (ref != nullptr && b >= (int) std::floor (refT0()) && b < refT1())
+                g.drawText (juce::String (b + 1), juce::Rectangle<float> (x + 2.0f, a.getBottom() - 12.0f, 40.0f, 11.0f), juce::Justification::centredLeft);
+        }
+        const double off = proc.getAlignOffsetBars();
+        for (int sb = (int) std::floor (vs - off) - 1; sb <= (int) std::ceil (vs + vb - off); ++sb)
+        {
+            if (((sb % labelStep) + labelStep) % labelStep != 0) continue;
+            const float x = xForBar (sb);
+            if (x < s.getX() || x > s.getRight() - 20.0f || ! haveSong || sb < 0) continue;
+            g.setColour (muted.withAlpha (0.85f));
+            g.drawText (juce::String (startBar + sb), juce::Rectangle<float> (x + 2.0f, s.getBottom() - 12.0f, 40.0f, 11.0f), juce::Justification::centredLeft);
+        }
+    }
+
+    // ---- reference lane
     float selWx0 = -1, selWx1 = -1;
     if (ref == nullptr || proc.isLoading())
     {
@@ -535,87 +820,74 @@ void ArrangementView::paint (juce::Graphics& g)
     }
     else
     {
-        const double bpm = proc.getBpm(), barSec = 240.0 / bpm;
+        const double barSec = refBarSec();
         const int barsAvail = proc.getNumReferenceBars();
         const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, barsAvail));
-        const double winStart = proc.getGridStartSec() + proc.getWindowStartBar() * barSec;
-        const float wx0 = xForTime (winStart), wx1 = xForTime (winStart + bars * barSec);
+        const float wx0 = xForT (proc.getWindowStartBar()), wx1 = xForT (proc.getWindowStartBar() + bars);
         selWx0 = wx0;  selWx1 = wx1;
-
-        const auto n = ref->overviewMin.size();
-        float peak = 1.0e-6f;
-        for (size_t i = 0; i < n; ++i) peak = std::max ({ peak, ref->overviewMax[i], -ref->overviewMin[i] });
-        const float mid = a.getCentreY(), half = a.getHeight() * 0.44f / peak;
-        for (size_t i = 0; i < n; ++i)
         {
-            const float x = a.getX() + a.getWidth() * (float) i / (float) n;
-            g.setColour (x >= wx0 && x <= wx1 ? red.withAlpha (0.9f) : redDim.withAlpha (0.8f));
-            g.drawVerticalLine ((int) x, mid - ref->overviewMax[i] * half, mid - ref->overviewMin[i] * half + 1.0f);
+            juce::Graphics::ScopedSaveState ss (g);
+            g.reduceClipRegion (a.toNearestInt());
+            drawLaneWave (g, a, true, wx0, wx1, red.withAlpha (0.9f), redDim.withAlpha (0.8f));
+            // where each pair (on this reference) points
+            for (int i = 0; i < (int) pairs.size(); ++i)
+            {
+                const auto& p = pairs[(size_t) i];
+                if (p.slot != proc.getActiveSlot()) continue;
+                auto band = juce::Rectangle<float>::leftTopRightBottom (xForT (p.refStart), a.getBottom() - 5.0f, xForT (p.refStart + p.refBars), a.getBottom() - 1.0f);
+                g.setColour (pairColour (p.colour).withAlpha (i == sel ? 1.0f : 0.6f));
+                g.fillRect (band);
+            }
+            auto win = juce::Rectangle<float> (wx0, a.getY(), wx1 - wx0, a.getHeight());
+            g.setColour (red.withAlpha (0.10f));
+            g.fillRoundedRectangle (win, 4.0f);
+            g.setColour (red.withAlpha (0.25f));
+            g.drawRoundedRectangle (win, 4.0f, 3.0f);
+            g.setColour (sel >= 0 && sel < (int) pairs.size() ? pairColour (pairs[(size_t) sel].colour) : red);
+            g.drawRoundedRectangle (win, 4.0f, 1.4f);
+            // the reference bars you're picking (pairing, step 2)
+            if (refA >= 0 && refB > refA)
+            {
+                auto d = juce::Rectangle<float>::leftTopRightBottom (xForT (refA), a.getY(), xForT (refB), a.getBottom());
+                g.setColour (juce::Colours::white.withAlpha (0.16f));
+                g.fillRoundedRectangle (d, 4.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.9f));
+                g.drawRoundedRectangle (d, 4.0f, 1.4f);
+            }
+            const double ph = proc.getRefPlayPositionSec();
+            if (ph >= 0)
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.85f));
+                g.drawVerticalLine ((int) xForTime (ph), a.getY(), a.getBottom());
+            }
+            auto marker = [&] (int bar, const juce::String& label, juce::Colour c)
+            {
+                if (bar < 0 || barsAvail <= gs::kBars) return;
+                const float x = xForT (bar);
+                g.setColour (c.withAlpha (0.8f));
+                g.fillRect (x - 1.0f, a.getY(), 2.0f, 8.0f);
+                g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+                g.drawText (label, juce::Rectangle<float> (x + 3.0f, a.getY() + 1.0f, 80.0f, 11.0f), juce::Justification::centredLeft);
+            };
+            marker (proc.getDropBar(), "DROP", yellow);
+            marker (proc.getBreakdownBar(), "BREAKDOWN", blue);
         }
-        for (int b = 0;; ++b)
-        {
-            const double t = proc.getGridStartSec() + b * barSec;
-            if (t > ref->lengthSeconds()) break;
-            if (t < 0) continue;
-            g.setColour (juce::Colours::white.withAlpha (b % 4 == 0 ? 0.16f : 0.05f));
-            g.drawVerticalLine ((int) xForTime (t), a.getY(), a.getBottom());
-        }
-        // where each pair (on this reference) points
-        for (int i = 0; i < (int) pairs.size(); ++i)
-        {
-            const auto& p = pairs[(size_t) i];
-            if (p.slot != proc.getActiveSlot()) continue;
-            const double t0 = proc.getGridStartSec() + p.refStart * barSec;
-            auto band = juce::Rectangle<float> (xForTime (t0), a.getBottom() - 5.0f, xForTime (t0 + p.refBars * barSec) - xForTime (t0), 4.0f);
-            g.setColour (pairColour (p.colour).withAlpha (i == sel ? 1.0f : 0.6f));
-            g.fillRect (band);
-        }
-        auto win = juce::Rectangle<float> (wx0, a.getY(), wx1 - wx0, a.getHeight());
-        g.setColour (red.withAlpha (0.10f));
-        g.fillRoundedRectangle (win, 4.0f);
-        g.setColour (red.withAlpha (0.25f));
-        g.drawRoundedRectangle (win, 4.0f, 3.0f);
-        g.setColour (sel >= 0 && sel < (int) pairs.size() ? pairColour (pairs[(size_t) sel].colour) : red);
-        g.drawRoundedRectangle (win, 4.0f, 1.4f);
-        const double ph = proc.getRefPlayPositionSec();
-        if (ph >= 0)
-        {
-            g.setColour (juce::Colours::white.withAlpha (0.85f));
-            g.drawVerticalLine ((int) xForTime (ph), a.getY(), a.getBottom());
-        }
-        auto marker = [&] (int bar, const juce::String& label, juce::Colour c)
-        {
-            if (bar < 0 || barsAvail <= gs::kBars) return;
-            const float x = xForTime (proc.getGridStartSec() + bar * barSec);
-            g.setColour (c.withAlpha (0.8f));
-            g.fillRect (x - 1.0f, a.getY(), 2.0f, 8.0f);
-            g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
-            g.drawText (label, juce::Rectangle<float> (x + 3.0f, a.getY() + 1.0f, 80.0f, 11.0f), juce::Justification::centredLeft);
-        };
-        marker (proc.getDropBar(), "DROP", yellow);
-        marker (proc.getBreakdownBar(), "BREAKDOWN", blue);
-
+        juce::ignoreUnused (barSec);
         g.setColour (red);
         g.setFont (juce::FontOptions (12.5f, juce::Font::bold));
         const int first = proc.getWindowStartBar() + 1;
         const juce::String tag = sel >= 0 ? "PAIR " + juce::String (sel + 1) + "  "
                                : proc.isBreakdownMode() ? "BREAKDOWN  "
                                : (proc.getWindowStartBar() == proc.getDropBar() ? "DROP  " : juce::String());
-        g.drawText (tag + "bars " + juce::String (first) + "-" + juce::String (first + bars - 1) + " of " + juce::String (barsAvail)
-                        + "  |  drag to move",
-                    head, juce::Justification::centredRight);
+        if (step == Step::none)
+            g.drawText (tag + "bars " + juce::String (first) + "-" + juce::String (first + bars - 1) + " of " + juce::String (barsAvail),
+                        head, juce::Justification::centredRight);
     }
 
     // ---- your learned track
-    auto s = songLane();
-    g.setColour (juce::Colour (0xff0d0d11));
-    g.fillRoundedRectangle (s, 6.0f);
-    const auto& ovMn = proc.getLearnedOverviewMin();
-    const auto& ovMx = proc.getLearnedOverviewMax();
-    const int per = gs::SongRecorder::kOverviewPerBar, trim = proc.getTrimBars();
     const int shown = songBarsShown();
     const int startBar = proc.getEffectiveStartBar();
-    if (proc.getLearnedBars() <= 0 && ovMn.empty())
+    if (! haveSong)
     {
         g.setColour (muted);
         g.setFont (juce::FontOptions (13.0f));
@@ -624,79 +896,80 @@ void ArrangementView::paint (juce::Graphics& g)
     }
     else
     {
-        float peak = 1.0e-6f;
-        for (size_t i = (size_t) trim * per; i < ovMn.size(); ++i) peak = std::max ({ peak, ovMx[i], -ovMn[i] });
-        const float mid = s.getCentreY(), half = s.getHeight() * 0.42f / peak;
-        const int total = juce::jmin ((int) ovMn.size() / per - trim, shown);
-        for (int b = 0; b < total; ++b)
-            for (int q = 0; q < per; ++q)
-            {
-                const size_t idx = (size_t) (b + trim) * per + q;
-                const float x0 = xForBar (b + q / (double) per), x1 = xForBar (b + (q + 1) / (double) per);
-                g.setColour (juce::Colour (0xffd8d8de).withAlpha (0.55f));
-                g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x0, mid - ovMx[idx] * half, juce::jmax (x0 + 0.8f, x1),
-                                                                         mid - ovMn[idx] * half + 1.0f));
-            }
-    }
-    // bar lines + Ableton bar numbers
-    g.setFont (juce::FontOptions (9.5f));
-    for (int b = 0; b <= shown; b += 4)
-    {
-        const float x = xForBar (b);
-        g.setColour (juce::Colours::white.withAlpha (b % 16 == 0 ? 0.16f : 0.06f));
-        g.drawVerticalLine ((int) x, s.getY(), s.getBottom());
-        if (b % 16 == 0 && b < shown)
-        {
-            g.setColour (muted.withAlpha (0.9f));
-            g.drawText (juce::String (startBar + b), juce::Rectangle<float> (x + 2.0f, s.getBottom() - 12.0f, 40.0f, 11.0f),
-                        juce::Justification::centredLeft);
-        }
+        juce::Graphics::ScopedSaveState ss (g);
+        g.reduceClipRegion (s.toNearestInt());
+        drawLaneWave (g, s, false, 0.0f, -1.0f, juce::Colour (0xffd8d8de).withAlpha (0.55f), juce::Colour (0xffd8d8de).withAlpha (0.55f));
     }
     // pairs
-    for (int i = 0; i < (int) pairs.size(); ++i)
     {
-        const auto& p = pairs[(size_t) i];
-        int a0 = p.songStart, a1 = p.songEnd;
-        if ((drag == Drag::resizeStart || drag == Drag::resizeEnd) && dragPair == i) { a0 = tempA; a1 = tempB; }
-        auto block = juce::Rectangle<float>::leftTopRightBottom (xForBar (a0), s.getY() + 1.0f, xForBar (a1), s.getBottom() - 1.0f);
-        const auto c = pairColour (p.colour);
-        g.setColour (c.withAlpha (i == sel ? 0.28f : 0.14f));
-        g.fillRoundedRectangle (block, 4.0f);
-        g.setColour (c.withAlpha (i == sel ? 1.0f : 0.7f));
-        g.drawRoundedRectangle (block, 4.0f, i == sel ? 2.0f : 1.0f);
-        auto tag = juce::Rectangle<float> (block.getX() + 4.0f, block.getY() + 3.0f, 32.0f, 14.0f);
-        g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
-        g.drawText (juce::String (i + 1) + (p.slot == 1 ? "B" : ""), tag.withTrimmedLeft (12.0f), juce::Justification::centredLeft);
-        const auto light = p.status == 1 ? green : p.status == 2 ? yellow : p.status == 3 ? over : grey;
-        g.setColour (light.withAlpha (0.3f));
-        g.fillEllipse (juce::Rectangle<float> (12.0f, 12.0f).withCentre ({ tag.getX() + 5.0f, tag.getCentreY() }));
-        g.setColour (light);
-        g.fillEllipse (juce::Rectangle<float> (8.0f, 8.0f).withCentre ({ tag.getX() + 5.0f, tag.getCentreY() }));
-        if (p.needsLearn)
+        juce::Graphics::ScopedSaveState ss (g);
+        g.reduceClipRegion (s.toNearestInt());
+        for (int i = 0; i < (int) pairs.size(); ++i)
         {
-            g.setColour (yellow);
-            g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
-            g.drawText ("RE-LEARN", block.reduced (4.0f, 2.0f), juce::Justification::bottomLeft);
+            const auto& p = pairs[(size_t) i];
+            int a0 = p.songStart, a1 = p.songEnd;
+            if ((drag == Drag::resizeStart || drag == Drag::resizeEnd) && dragPair == i) { a0 = tempA; a1 = tempB; }
+            auto block = juce::Rectangle<float>::leftTopRightBottom (xForBar (a0), s.getY() + 1.0f, xForBar (a1), s.getBottom() - 1.0f);
+            const auto c = pairColour (p.colour);
+            const bool dim = step != Step::none && i != editIndex;
+            g.setColour (c.withAlpha (dim ? 0.06f : (i == sel ? 0.28f : 0.14f)));
+            g.fillRoundedRectangle (block, 4.0f);
+            g.setColour (c.withAlpha (dim ? 0.35f : (i == sel ? 1.0f : 0.7f)));
+            g.drawRoundedRectangle (block, 4.0f, i == sel ? 2.0f : 1.0f);
+            // lights: MIX (your mix) and OUT (with Ground Shake's correction)
+            auto light = [&] (int st, float cx, float cy, const juce::String& label)
+            {
+                const auto col = st == 1 ? green : st == 2 ? yellow : st == 3 ? over : grey;
+                g.setColour (col.withAlpha (0.3f));
+                g.fillEllipse (juce::Rectangle<float> (11.0f, 11.0f).withCentre ({ cx, cy }));
+                g.setColour (col);
+                g.fillEllipse (juce::Rectangle<float> (7.0f, 7.0f).withCentre ({ cx, cy }));
+                if (label.isNotEmpty())
+                {
+                    g.setColour (c.withAlpha (0.95f));
+                    g.setFont (juce::FontOptions (8.5f, juce::Font::bold));
+                    g.drawText (label, juce::Rectangle<float> (cx + 6.0f, cy - 5.0f, 24.0f, 10.0f), juce::Justification::centredLeft);
+                }
+            };
+            const float ty = block.getY() + 9.0f;
+            g.setColour (c.withAlpha (dim ? 0.4f : 1.0f));
+            g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+            g.drawText (juce::String (i + 1) + (p.slot == 1 ? "B" : ""), juce::Rectangle<float> (block.getX() + 4.0f, ty - 7.0f, 20.0f, 14.0f),
+                        juce::Justification::centredLeft);
+            const bool roomy = block.getWidth() >= 92.0f;
+            const float lx = block.getX() + 26.0f;
+            if (block.getWidth() >= 40.0f)
+            {
+                light (p.status, lx, ty, roomy ? "MIX" : "");
+                if (p.correctionOn())
+                    light (p.outValid ? p.outStatus : 0, lx + (roomy ? 34.0f : 14.0f), ty, roomy ? (p.outValid ? "OUT" : "OUT..") : "");
+            }
+            if (p.needsLearn)
+            {
+                g.setColour (yellow);
+                g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+                g.drawText ("RE-LEARN", block.reduced (4.0f, 2.0f), juce::Justification::bottomLeft);
+            }
         }
-    }
-    // the stretch you're dragging out
-    if (draftA >= 0 && draftB > draftA)
-    {
-        auto d = juce::Rectangle<float>::leftTopRightBottom (xForBar (draftA), s.getY(), xForBar (draftB), s.getBottom());
-        g.setColour (juce::Colours::white.withAlpha (0.12f));
-        g.fillRoundedRectangle (d, 4.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.8f));
-        g.drawRoundedRectangle (d, 4.0f, 1.2f);
-        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
-        g.drawText ("bars " + juce::String (startBar + draftA) + "-" + juce::String (startBar + draftB - 1) + "  (+ PAIR)",
-                    d.reduced (4.0f, 2.0f).withHeight (14.0f), juce::Justification::centredLeft, false);
-    }
-    // the playhead, and the learn pass
-    const double nowBar = proc.getSongBarNow();
-    if (proc.isHostPlaying() && nowBar >= 0 && nowBar < shown)
-    {
-        g.setColour (juce::Colours::white.withAlpha (0.85f));
-        g.drawVerticalLine ((int) xForBar (nowBar), s.getY(), s.getBottom());
+        // the stretch you're marking
+        if (draftA >= 0 && draftB > draftA)
+        {
+            auto d = juce::Rectangle<float>::leftTopRightBottom (xForBar (draftA), s.getY(), xForBar (draftB), s.getBottom());
+            g.setColour (juce::Colours::white.withAlpha (0.14f));
+            g.fillRoundedRectangle (d, 4.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.9f));
+            g.drawRoundedRectangle (d, 4.0f, 1.4f);
+            g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+            g.drawText ("bars " + juce::String (startBar + draftA) + "-" + juce::String (startBar + draftB - 1),
+                        d.reduced (4.0f, 2.0f).withHeight (14.0f).withY (s.getBottom() - 16.0f), juce::Justification::centredLeft, false);
+        }
+        // the playhead, and the learn pass
+        const double nowBar = proc.getSongBarNow();
+        if (proc.isHostPlaying() && nowBar >= 0 && nowBar < shown)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.85f));
+            g.drawVerticalLine ((int) xForBar (nowBar), s.getY(), s.getBottom());
+        }
     }
     g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
     g.setColour (muted);
@@ -705,26 +978,132 @@ void ArrangementView::paint (juce::Graphics& g)
     {
         g.setColour (red);
         g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-        g.drawText ("LEARNING  bar " + juce::String (startBar + (int) juce::jmax (0.0, nowBar)), s.reduced (8.0f, 4.0f).withTrimmedTop (12.0f),
+        g.drawText ("LEARNING  bar " + juce::String (startBar + (int) juce::jmax (0.0, proc.getSongBarNow())), s.reduced (8.0f, 4.0f).withTrimmedTop (12.0f),
                     juce::Justification::topRight);
     }
     // connect the selected pair to where it points in the reference
-    if (sel >= 0 && sel < (int) pairs.size() && selWx0 >= 0 && pairs[(size_t) sel].slot == proc.getActiveSlot())
+    if (step == Step::none && sel >= 0 && sel < (int) pairs.size() && selWx0 >= 0 && pairs[(size_t) sel].slot == proc.getActiveSlot())
     {
         const auto& p = pairs[(size_t) sel];
-        const float xa = (selWx0 + selWx1) * 0.5f, xb = (xForBar (p.songStart) + xForBar (p.songEnd)) * 0.5f;
+        const float xa = (xForT (p.refStart) + xForT (p.refStart + p.refBars)) * 0.5f, xb = (xForBar (p.songStart) + xForBar (p.songEnd)) * 0.5f;
         juce::Path link;
         link.startNewSubPath (xa, a.getBottom());
-        link.cubicTo (xa, a.getBottom() + 5.0f, xb, s.getY() - 5.0f, xb, s.getY());
+        link.cubicTo (xa, a.getBottom() + 3.0f, xb, s.getY() - 3.0f, xb, s.getY());
         g.setColour (pairColour (p.colour).withAlpha (0.85f));
         g.strokePath (link, juce::PathStrokeType (1.6f));
     }
+
+    // ---- guided pairing: dim the lane you're not working on
+    if (step != Step::none)
+    {
+        auto other = step == Step::song ? a : s;
+        auto work = step == Step::song ? s : a;
+        g.setColour (juce::Colours::black.withAlpha (0.55f));
+        g.fillRoundedRectangle (other, 6.0f);
+        g.setColour (yellow.withAlpha (0.9f));
+        g.drawRoundedRectangle (work.expanded (1.5f), 7.0f, 1.6f);
+    }
+
+    // ---- bottom row: nudge + zoom, or the pairing prompt
+    const float by = 140.0f;
+    if (step == Step::none)
+    {
+        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+        g.setColour (muted);
+        g.drawText ("NUDGE", juce::Rectangle<float> (16.0f, by, 48.0f, 20.0f), juce::Justification::centredLeft);
+        const double off = proc.getAlignOffsetBars();
+        const int whole = (int) std::trunc (off);
+        const int beats = (int) std::round (std::abs (off - whole) * 4.0);
+        juce::String o = std::abs (off) < 0.01 ? juce::String ("lined up at the start")
+                         : "your track " + juce::String (off > 0 ? "+" : "-") + juce::String (std::abs (whole)) + (std::abs (whole) == 1 ? " bar" : " bars")
+                               + (beats > 0 ? " " + juce::String (beats) + (beats == 1 ? " beat" : " beats") : juce::String());
+        g.setColour (std::abs (off) < 0.01 ? muted : text);
+        g.setFont (juce::FontOptions (11.0f));
+        g.drawText (o, juce::Rectangle<float> (146.0f, by, 190.0f, 20.0f), juce::Justification::centredLeft);
+        g.setColour (muted.withAlpha (0.8f));
+        g.setFont (juce::FontOptions (10.5f));
+        g.drawText ("Shift: one beat.  Wheel: zoom, Shift+wheel: scroll.  Drag on your track to make a pair.",
+                    juce::Rectangle<float> (336.0f, by, (float) getWidth() - 336.0f - 150.0f, 20.0f), juce::Justification::centredLeft, true);
+    }
+    else
+    {
+        g.setColour (yellow);
+        g.setFont (juce::FontOptions (11.5f, juce::Font::bold));
+        g.drawFittedText (prompt(), juce::Rectangle<float> (16.0f, by, 538.0f, 20.0f).toNearestInt(), juce::Justification::centredLeft, 1, 0.8f);
+    }
+    g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+    g.setColour (muted);
+    g.drawText ("ZOOM", juce::Rectangle<float> ((float) getWidth() - 180.0f, by, 42.0f, 20.0f), juce::Justification::centredRight);
 }
 
+//------------------------------------------------------------------------------
+//  Guided pairing
+juce::String ArrangementView::prompt() const
+{
+    const bool edit = editIndex >= 0;
+    const juce::String which = edit ? "PAIR " + juce::String (editIndex + 1) + " - " : juce::String();
+    if (step == Step::song)
+        return which + "STEP 1 of 2: drag across the part of YOUR track you want to fix" + (edit ? juce::String (" (or KEEP BARS)") : juce::String());
+    if (step == Step::ref)
+        return which + "STEP 2 of 2: drag across the REFERENCE bars it should sound like (or click a bar)";
+    return {};
+}
+
+void ArrangementView::startPairing (int index)
+{
+    editIndex = index >= 0 && index < (int) proc.getPairs().size() ? index : -1;
+    step = Step::song;
+    draftA = draftB = -1;
+    refA = refB = -1;
+    if (editIndex < 0 && proc.getSelectedPair() >= 0) proc.selectPair (-1);
+    refreshButtons();
+    grabKeyboardFocus();
+    repaint();
+    if (onPairingChanged) onPairingChanged();
+}
+
+void ArrangementView::cancelPairing()
+{
+    step = Step::none;
+    editIndex = -1;
+    draftA = draftB = -1;
+    refA = refB = -1;
+    refreshButtons();
+    repaint();
+    if (onPairingChanged) onPairingChanged();
+}
+
+void ArrangementView::finishPairing (int refStart, int refBars)
+{
+    const int nRef = juce::jmax (1, proc.getNumReferenceBars());
+    refBars = juce::jlimit (1, gs::kBars, refBars);
+    refStart = juce::jlimit (0, juce::jmax (0, nRef - 1), refStart);
+    const int a0 = draftA, b0 = draftB, idx = editIndex;
+    step = Step::none;
+    editIndex = -1;
+    draftA = draftB = -1;
+    refA = refB = -1;
+    refreshButtons();
+    if (a0 >= 0 && b0 > a0)
+    {
+        if (idx >= 0) proc.editPair (idx, a0, b0, proc.getActiveSlot(), refStart, refBars);
+        else          proc.addPairExplicit (a0, b0, proc.getActiveSlot(), refStart, refBars);
+    }
+    repaint();
+    if (onPairingChanged) onPairingChanged();
+}
+
+bool ArrangementView::keyPressed (const juce::KeyPress& k)
+{
+    if (k == juce::KeyPress::escapeKey && step != Step::none) { cancelPairing(); return true; }
+    return false;
+}
+
+//------------------------------------------------------------------------------
 void ArrangementView::mouseMove (const juce::MouseEvent& e)
 {
     int edge = 0;
-    const bool inSong = songLane().contains (e.position);
+    const bool inSong = songLane().contains (e.position) && step == Step::none;
     const int i = inSong ? pairAt (e.position.x, edge) : -1;
     setMouseCursor (i >= 0 && edge != 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
 }
@@ -732,12 +1111,21 @@ void ArrangementView::mouseMove (const juce::MouseEvent& e)
 void ArrangementView::mouseDown (const juce::MouseEvent& e)
 {
     drag = Drag::none;
-    if (refLane().expanded (0.0f, 4.0f).contains (e.position))
+    const bool inRef = refLane().expanded (0.0f, 4.0f).contains (e.position);
+    const bool inSong = songLane().contains (e.position);
+    if (inRef)
     {
         if (proc.getReference() == nullptr) return;
+        if (step == Step::ref)
+        {
+            drag = Drag::refPick;
+            refAnchor = refBarForX (e.position.x);
+            refA = refB = -1;
+            return;
+        }
+        if (step != Step::none) return;
         drag = Drag::refWindow;
-        const double barSec = 240.0 / proc.getBpm();
-        const int barUnder = (int) std::floor ((timeForX (e.position.x) - proc.getGridStartSec()) / barSec);
+        const int barUnder = refBarForX (e.position.x);
         const int start = proc.getWindowStartBar();
         const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, proc.getNumReferenceBars()));
         if (barUnder >= start && barUnder < start + bars)
@@ -749,7 +1137,18 @@ void ArrangementView::mouseDown (const juce::MouseEvent& e)
         }
         return;
     }
-    if (! songLane().contains (e.position)) return;
+    if (! inSong) return;
+    if (step != Step::none)
+    {
+        // marking (or re-marking) the stretch of your track
+        if (step == Step::ref) { step = Step::song; refA = refB = -1; }
+        drag = Drag::draft;
+        draftAnchor = juce::jmax (0, (int) std::floor (barForX (e.position.x)));
+        draftA = draftB = -1;
+        refreshButtons();
+        repaint();
+        return;
+    }
     int edge = 0;
     const int i = pairAt (e.position.x, edge);
     if (i >= 0 && edge != 0)
@@ -763,12 +1162,9 @@ void ArrangementView::mouseDown (const juce::MouseEvent& e)
     if (i >= 0)
     {
         proc.selectPair (i);              // clicking a pair turns FOLLOW off
-        clearDraft();
-        if (onDraftChanged) onDraftChanged();
         return;
     }
-    // starting a new stretch: let go of the selected pair, so moving the reference window
-    // next doesn't re-point that pair
+    // dragging on an empty part of your track starts a new pair (step 1 done by the drag)
     if (proc.getSelectedPair() >= 0) proc.selectPair (-1);
     drag = Drag::draft;
     draftAnchor = juce::jmax (0, (int) std::floor (barForX (e.position.x)));
@@ -779,20 +1175,32 @@ void ArrangementView::mouseDrag (const juce::MouseEvent& e)
 {
     if (drag == Drag::refWindow)
     {
-        const double barSec = 240.0 / proc.getBpm();
-        const int barUnder = (int) std::floor ((timeForX (e.position.x) - proc.getGridStartSec()) / barSec);
-        const int target = barUnder - dragGrabBarOffset;
+        const int target = refBarForX (e.position.x) - dragGrabBarOffset;
         if (target != proc.getWindowStartBar()) proc.setWindowStartBar (target);
+        return;
+    }
+    if (drag == Drag::refPick)
+    {
+        if (e.getDistanceFromDragStart() < 4) return;
+        const int cur = refBarForX (e.position.x);
+        int lo = juce::jmin (refAnchor, cur), hi = juce::jmax (refAnchor, cur) + 1;
+        int len = 1;
+        for (int c : { 1, 2, 4, 8 }) if (hi - lo >= c) len = c;     // 1, 2, 4 or 8 bars
+        if (cur < refAnchor) lo = refAnchor + 1 - len;
+        refA = juce::jmax (0, lo);
+        refB = refA + len;
+        repaint();
         return;
     }
     const int bar = juce::jlimit (0, songBarsShown(), (int) std::round (barForX (e.position.x)));
     if (drag == Drag::draft)
     {
+        if (e.getDistanceFromDragStart() < 3) return;
         const int cur = juce::jmax (0, (int) std::floor (barForX (e.position.x)));
         draftA = juce::jmin (draftAnchor, cur);
         draftB = juce::jmax (draftAnchor, cur) + 1;
+        refreshButtons();
         repaint();
-        if (onDraftChanged) onDraftChanged();
     }
     else if (drag == Drag::resizeStart) { tempA = juce::jmin (bar, tempB - 1); repaint(); }
     else if (drag == Drag::resizeEnd)   { tempB = juce::jmax (bar, tempA + 1); repaint(); }
@@ -800,15 +1208,32 @@ void ArrangementView::mouseDrag (const juce::MouseEvent& e)
 
 void ArrangementView::mouseUp (const juce::MouseEvent& e)
 {
-    if ((drag == Drag::resizeStart || drag == Drag::resizeEnd) && dragPair >= 0)
-        proc.setPairRange (dragPair, tempA, tempB);
-    else if (drag == Drag::draft && e.mouseWasClicked())
-    {
-        clearDraft();                      // a plain click clears the stretch
-        if (onDraftChanged) onDraftChanged();
-    }
+    const auto d = drag;
     drag = Drag::none;
+    if ((d == Drag::resizeStart || d == Drag::resizeEnd) && dragPair >= 0)
+        proc.setPairRange (dragPair, tempA, tempB);
+    else if (d == Drag::draft)
+    {
+        if (draftA >= 0 && draftB > draftA)
+        {
+            // step 1 done: now the reference bars
+            if (step == Step::none) { editIndex = -1; grabKeyboardFocus(); }
+            step = Step::ref;
+            refA = refB = -1;
+            if (onPairingChanged) onPairingChanged();
+        }
+        else if (step == Step::none && e.mouseWasClicked() && proc.getSelectedPair() >= 0)
+            proc.selectPair (-1);
+    }
+    else if (d == Drag::refPick)
+    {
+        if (refA >= 0 && refB > refA) finishPairing (refA, refB - refA);
+        else finishPairing (refAnchor, proc.getWindowBars());          // a click: start there, current length
+        dragPair = -1;
+        return;
+    }
     dragPair = -1;
+    refreshButtons();
     repaint();
 }
 
@@ -1124,10 +1549,18 @@ void ChecklistView::paint (juce::Graphics& g)
         g.drawText (txt, b, juce::Justification::centred);
     };
     const int sel = proc.getSelectedPair();
-    if (sel >= 0)
-        badge ("PAIR " + juce::String (sel + 1) + (proc.isShowingSavedPair() ? " LEARNED" : " LIVE"),
+    const bool master = proc.getViewMode() == GroundShakeProcessor::ViewMode::master;
+    if (master)
+        badge ("MASTER BUS", red, head.getX() + 142.0f);
+    else if (sel >= 0)
+    {
+        const bool live = ! proc.isShowingSavedPair();
+        const juce::String v = proc.isShowingOut() ? " OUT"
+                             : (proc.getViewMode() == GroundShakeProcessor::ViewMode::out && proc.getPairs()[(size_t) sel].correctionOn() && ! live ? " OUT..." : " MIX");
+        badge ("PAIR " + juce::String (sel + 1) + (live ? (proc.getViewMode() == GroundShakeProcessor::ViewMode::mix ? " MIX LIVE" : " OUT LIVE") : v),
                ArrangementView::pairColour (proc.getPairs()[(size_t) sel].colour), head.getX() + 142.0f);
-    if (proc.isDisplayBreakdown())
+    }
+    if (! master && proc.isDisplayBreakdown())
         badge ("BREAKDOWN", blue, head.getX() + (sel >= 0 ? 252.0f : 142.0f));
 
     auto bar = inner.removeFromTop (12.0f).withSizeKeepingCentre (inner.getWidth(), 6.0f);
@@ -1239,7 +1672,9 @@ float FixListView::layoutCard (juce::Graphics* g, const gs::FixCard& c, bool exp
     if (c.fixFirst)                         badge ("FIX THIS FIRST", red);
     else if (c.severity == Status::holding) badge ("FIXED - HOLDING FOR ONE LOOP", green);
     else if (c.severity == Status::info)    badge ("INFORMATION", grey);
-    if (c.adviceOnly && c.severity != Status::holding) badge ("SOUND / NOTE CHOICE: YOU CHANGE THIS", yellow);
+    const bool masterCard = (int) c.id >= (int) gs::CheckId::masterTone;
+    if (c.adviceOnly && c.severity != Status::holding)
+        badge (masterCard ? "MASTER CHAIN: YOU CHANGE THIS" : "SOUND / NOTE CHOICE: YOU CHANGE THIS", yellow);
 
     {
         auto tl = layoutText (attr (c.title, font (13.0f, true), text), w - 18.0f);
@@ -1390,7 +1825,8 @@ GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
              &halfButton, &nudgeLeft, &nudgeRight, &dropButton, &breakdownButton, &bars1, &bars2, &bars4, &bars8,
              &loopButton, &bpmLabel, &bpmTitle, &detectedLabel, &offsetLabel,
              &rangeKnob, &toleranceKnob, &autoButton, &snapshotButton, &resetButton, &reanalyzeButton, &dj6, &dj9, &dj12,
-             &matchButton, &previewButton, &applyButton, &revertButton, &weightButton })
+             &matchButton, &previewButton, &applyButton, &revertButton, &weightButton, &editPairButton,
+             &viewMix, &viewOut, &viewMaster })
         addAndMakeVisible (c);
 
     fixViewport.setViewedComponent (&fixList, false);
@@ -1510,7 +1946,7 @@ GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
     }
     slotA.onClick = [this] { if (slotA.getToggleState()) proc.setActiveSlot (0); };
     slotB.onClick = [this] { if (slotB.getToggleState()) proc.setActiveSlot (1); };
-    slotA.setTooltip ("Reference A. With a pair selected, switching moves that pair to this reference.");
+    slotA.setTooltip ("Reference A. To move a pair to the other reference, select it and press EDIT.");
     slotB.setTooltip ("Reference B: load a second reference for sections the first one doesn't have.");
 
     // ---- learn pass and pairs
@@ -1522,12 +1958,10 @@ GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
     learnButton.setTooltip ("Press, then play your song in Ableton from the song start bar to the end. Press again to finish.");
     learnPairButton.onClick = [this] { proc.startLearnPair (proc.getSelectedPair()); };
     learnPairButton.setTooltip ("Re-learn just the selected pair after a mix change: press, then play that section.");
-    addPairButton.onClick = [this]
-    {
-        int a = 0, b = 0;
-        if (arrangement.getDraft (a, b)) { proc.addPair (a, b); arrangement.clearDraft(); }
-    };
-    addPairButton.setTooltip ("Pair the stretch you dragged on your track with the reference window above.");
+    addPairButton.onClick = [this] { arrangement.startPairing (-1); };
+    addPairButton.setTooltip ("New pair, step by step: mark a stretch of your track, then the reference bars it should sound like.");
+    editPairButton.onClick = [this] { arrangement.startPairing (proc.getSelectedPair()); };
+    editPairButton.setTooltip ("Change the selected pair: its bars on your track, then its reference bars (A or B).");
     deletePairButton.onClick = [this] { proc.deletePair (proc.getSelectedPair()); };
     autoPairButton.onClick = [this] { proc.autoPair(); };
     autoPairButton.setTooltip ("First guess: pair your drops with the reference's drop and your breakdowns with its breakdown.");
@@ -1539,7 +1973,20 @@ GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
     startDown.onClick = [this] { proc.setSongStartBar (proc.getSongStartBar() - 1); };
     startUp.onClick = [this] { proc.setSongStartBar (proc.getSongStartBar() + 1); };
     startDown.setTooltip ("The Ableton bar your song starts on (below 1 = AUTO: the first bar with sound). Remembered for every project.");
-    arrangement.onDraftChanged = [this] { refreshMatchControls(); };
+    arrangement.onPairingChanged = [this] { refreshMatchControls(); repaint (headerR.toNearestInt()); };
+
+    // ---- Phase 4: MIX / OUT / MASTER view
+    for (auto* b : { &viewMix, &viewOut, &viewMaster })
+    {
+        b->setClickingTogglesState (true);
+        b->setRadioGroupId (5);
+    }
+    viewMix.onClick = [this] { if (viewMix.getToggleState()) proc.setViewMode (GroundShakeProcessor::ViewMode::mix); };
+    viewOut.onClick = [this] { if (viewOut.getToggleState()) proc.setViewMode (GroundShakeProcessor::ViewMode::out); };
+    viewMaster.onClick = [this] { if (viewMaster.getToggleState()) proc.setViewMode (GroundShakeProcessor::ViewMode::master); };
+    viewMix.setTooltip ("MIX: your mix as it is (the cards say how to fix it in your tracks)");
+    viewOut.setTooltip ("OUT: your mix with Ground Shake's correction for the pair. Worked out straight away, no playback needed.");
+    viewMaster.setTooltip ("MASTER: your drop against the reference's drop - tone, width, low-end mono, squash and loudness - with advice for your master chain");
 
     // ---- correction knobs
     auto setupKnob = [] (juce::Slider& k, double lo, double hi, double step, double def)
@@ -1665,9 +2112,14 @@ void GroundShakeContent::refreshMatchControls()
     learnButton.setButtonText (learningNow ? "STOP" : "LEARN");
     learnButton.setToggleState (learningNow, juce::dontSendNotification);
     learnPairButton.setEnabled (! learningNow && sel >= 0);
-    int a = 0, b = 0;
-    addPairButton.setEnabled (! learningNow && arrangement.getDraft (a, b) && proc.hasReference() && proc.getLearnedBars() > 0);
-    deletePairButton.setEnabled (! learningNow && sel >= 0);
+    const bool pairing = arrangement.isPairing();
+    addPairButton.setEnabled (! learningNow && ! pairing && proc.hasReference() && proc.getLearnedBars() > 0);
+    editPairButton.setEnabled (! learningNow && ! pairing && sel >= 0 && proc.hasReference());
+    deletePairButton.setEnabled (! learningNow && ! pairing && sel >= 0);
+    const auto vm = proc.getViewMode();
+    viewMix.setToggleState (vm == GroundShakeProcessor::ViewMode::mix, juce::dontSendNotification);
+    viewOut.setToggleState (vm == GroundShakeProcessor::ViewMode::out, juce::dontSendNotification);
+    viewMaster.setToggleState (vm == GroundShakeProcessor::ViewMode::master, juce::dontSendNotification);
     autoPairButton.setEnabled (! learningNow && proc.hasLearnedTrack() && proc.hasReference());
     matchAllButton.setEnabled (! learningNow && pairMode);
     followButton.setToggleState (proc.isFollowingPlayhead(), juce::dontSendNotification);
@@ -1702,13 +2154,26 @@ juce::String GroundShakeContent::statusText() const
 {
     if (proc.isLoading()) return "Analyzing the reference: tempo, downbeat, drop and sub...";
     if (proc.getLoadError().isNotEmpty()) return proc.getLoadError();
+    if (arrangement.isPairing()) return arrangement.prompt() + ".  CANCEL (or Esc) to stop.";
     const auto msg = proc.getLearnMessage();
     if (msg.isNotEmpty() && (proc.getLearnState() != GroundShakeProcessor::LearnState::off
                              || juce::Time::getMillisecondCounterHiRes() / 1000.0 - learnMessageTime < 8.0))
         return msg;
     const int sel = proc.getSelectedPair();
     const auto line = proc.getDisplayCoach().statusLine();
-    return sel >= 0 ? "Pair " + juce::String (sel + 1) + ": " + line : line;
+    if (proc.getViewMode() == GroundShakeProcessor::ViewMode::master)
+        return proc.hasMasterReport() ? line : (proc.isMasterRunning() ? juce::String ("Master check: measuring your drop against the reference's...")
+                                                                        : juce::String ("Master check: press LEARN and play your song, with a reference loaded."));
+    juce::String view;
+    if (sel >= 0)
+    {
+        const auto& p = proc.getPairs()[(size_t) sel];
+        if (proc.isShowingOut()) view = " (OUT, with Ground Shake)";
+        else if (proc.getViewMode() == GroundShakeProcessor::ViewMode::out && p.correctionOn() && ! p.outValid) view = " (working out OUT...)";
+        else if (proc.getViewMode() == GroundShakeProcessor::ViewMode::out && ! p.correctionOn()) view = " (no correction on: OUT = MIX)";
+        else view = " (MIX)";
+    }
+    return sel >= 0 ? "Pair " + juce::String (sel + 1) + view + ": " + line : line;
 }
 
 void GroundShakeContent::paint (juce::Graphics& g)
@@ -1730,7 +2195,7 @@ void GroundShakeContent::paint (juce::Graphics& g)
     g.drawText ("GROUND SHAKE", h.withTrimmedLeft (72.0f).withWidth (300.0f), juce::Justification::centredLeft);
     g.setColour (muted.withAlpha (0.7f));
     g.setFont (font (11.0f));
-    g.drawText ("phase 3", h.withTrimmedLeft (306.0f).withWidth (70.0f), juce::Justification::centredLeft);
+    g.drawText ("phase 4", h.withTrimmedLeft (306.0f).withWidth (70.0f), juce::Justification::centredLeft);
     {
         auto st = juce::Rectangle<float> (392.0f, headerR.getY() + 6.0f, 646.0f, headerR.getHeight() - 12.0f);
         g.setColour (juce::Colour (0xff0b0b0e));
@@ -1752,9 +2217,11 @@ void GroundShakeContent::paint (juce::Graphics& g)
         auto t = fixesR.reduced (16.0f, 0.0f).withHeight (30.0f);
         g.setColour (muted);
         g.setFont (font (13.0f, true));
-        g.drawText ("FIXES", t, juce::Justification::centredLeft);
-        g.setFont (font (11.0f));
-        g.drawText ("in fix order  |  click a card to open it", t, juce::Justification::centredRight);
+        const bool master = proc.getViewMode() == GroundShakeProcessor::ViewMode::master;
+        g.drawText (master ? "MASTER BUS" : "FIXES", t, juce::Justification::centredLeft);
+        g.setFont (font (10.5f));
+        g.drawText (master ? "advice for your master chain" : "in fix order | click to open", t.withTrimmedLeft (master ? 92.0f : 52.0f).withWidth (170.0f),
+                    juce::Justification::centredLeft);
     }
 
     // controls row labels
@@ -1923,13 +2390,18 @@ void GroundShakeContent::resized()
 
     // learn + pairs row
     const int y2 = (int) refR.getBottom() - 38;
-    learnButton.setBounds (32, y2, 80, 30);
-    learnPairButton.setBounds (116, y2, 96, 30);
-    addPairButton.setBounds (216, y2, 70, 30);
-    deletePairButton.setBounds (290, y2, 70, 30);
-    autoPairButton.setBounds (364, y2, 92, 30);
-    matchAllButton.setBounds (460, y2, 96, 30);
-    followButton.setBounds (560, y2, 82, 30);
+    learnButton.setBounds (32, y2, 72, 30);
+    learnPairButton.setBounds (108, y2, 90, 30);
+    addPairButton.setBounds (202, y2, 62, 30);
+    editPairButton.setBounds (268, y2, 52, 30);
+    deletePairButton.setBounds (324, y2, 62, 30);
+    autoPairButton.setBounds (390, y2, 86, 30);
+    matchAllButton.setBounds (480, y2, 88, 30);
+    followButton.setBounds (572, y2, 70, 30);
+    // view: MIX / OUT / MASTER (in the fixes title row)
+    viewMix.setBounds (1206, (int) fixesR.getY() + 5, 48, 22);
+    viewOut.setBounds (1256, (int) fixesR.getY() + 5, 48, 22);
+    viewMaster.setBounds (1306, (int) fixesR.getY() + 5, 70, 22);
     startDown.setBounds (774, y2 + 2, 26, 26);
     startUp.setBounds (846, y2 + 2, 26, 26);
 

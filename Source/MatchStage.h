@@ -8,7 +8,8 @@
 //  Preview or Apply (globally, or per pair in Phase 3).
 //
 //  Steady fixes : low cut, feel and punch EQ, sub mono below 120 Hz, sub "weight" harmonics
-//  Beat-synced  : built-in ducking (low-end gain per 16th of the beat, like a volume shaper),
+//  Beat-synced  (1st-order bands, so a cut is always a cut; Phase 4 fix)
+//               : built-in ducking (low-end gain per 16th of the beat, like a volume shaper),
 //                 kick attack (low end in the first ~12 ms of each beat), kick tail (low end
 //                 after the kick has rung for a while), and a mud cut on the kick 16th only
 //                 (where kick and bass clash)
@@ -68,7 +69,9 @@ public:
             c.monoLp1.setLowPass (sr, 120.0);  c.monoLp2.setLowPass (sr, 120.0);
             c.wLp1.setLowPass (sr, 120.0);     c.wLp2.setLowPass (sr, 120.0);
             c.hHp1.setHighPass (sr, 100.0);    c.hHp2.setHighPass (sr, 100.0);
-            c.att1.setLowPass (sr, 300.0);     c.att2.setLowPass (sr, 300.0);
+            // 1st-order bands: x + (g - 1) * LP1 changes the low end by g without the phase
+            // trouble a steeper split has (a 4th-order split's phase turns the cut into a boost near 100 Hz)
+            c.att1.setLowPass1 (sr, 300.0);
             c.mud.setBandPass (sr, 250.0, 1.0);
         }
     }
@@ -106,7 +109,7 @@ public:
                 c.fPeak.setPeak (sr, fc, 0.7, cur.feelDb);
                 c.pPeak.setPeak (sr, pc, 0.9, cur.punchDb);
                 c.hp1.setHighPass (sr, lowCutHz);  c.hp2.setHighPass (sr, lowCutHz);
-                c.low1.setLowPass (sr, cur.split * 2.0);  c.low2.setLowPass (sr, cur.split * 2.0);
+                c.low1.setLowPass1 (sr, cur.split * 2.5);
             }
             lastCoef = cur;
             lastCoef.lowCutHz = lowCutHz;
@@ -161,8 +164,8 @@ public:
                 {
                     auto& s = ch[(size_t) c];
                     const float in = x[c];
-                    const float low = s.low2.process (s.low1.process (in));
-                    const float att = s.att2.process (s.att1.process (in));
+                    const float low = s.low1.process (in);
+                    const float att = s.att1.process (in);
                     const float md = s.mud.process (in);
                     x[c] = in + (gLow - 1.0f) * low + (gAtt - 1.0f) * att + (gMud - 1.0f) * md;
                 }
@@ -206,7 +209,7 @@ public:
 private:
     struct Channel
     {
-        Biquad hp1, hp2, fPeak, pPeak, low1, low2, att1, att2, mud, monoLp1, monoLp2, wLp1, wLp2, hHp1, hHp2;
+        Biquad hp1, hp2, fPeak, pPeak, low1, att1, mud, monoLp1, monoLp2, wLp1, wLp2, hHp1, hHp2;
     };
     double sr = 44100.0;
     std::array<Channel, 2> ch;

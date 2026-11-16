@@ -85,6 +85,12 @@ juce::String checkName (CheckId id)
         case CheckId::mud:        return "Low-mid mud";
         case CheckId::squash:     return "Limiter squash";
         case CheckId::djPlayback: return "DJ playback";
+        case CheckId::masterTone:     return "Tone balance";
+        case CheckId::masterWidth:    return "Stereo width";
+        case CheckId::masterLowMono:  return "Low end mono";
+        case CheckId::masterSquash:   return "Limiter squash";
+        case CheckId::masterLoudness: return "Drop loudness";
+        case CheckId::masterChain:    return "Master chain";
         case CheckId::numChecks:
         case CheckId::fineTune:
         case CheckId::loudnessGap:

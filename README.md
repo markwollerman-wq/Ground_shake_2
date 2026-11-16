@@ -1,4 +1,4 @@
-# WOLLER Ground Shake (Phase 3)
+# WOLLER Ground Shake (Phase 4)
 
 A meter for the end of your master chain. It answers one question: **if you were standing on a club floor, how much would your feet feel this sub, and does it match your reference track, every 16th of the way?** Phase 2 adds a coach that tells you what to change, in what order, and how.
 
@@ -31,11 +31,11 @@ A meter for the end of your master chain. It answers one question: **if you were
 |---|---|
 | **Song start bar** | The Ableton bar your song starts on (default 9, remembered for every project). Below 1 = AUTO: the first bar with sound. |
 | **LEARN** | Press, then play your song in Ableton from the start bar to the end; press again (STOP). Ground Shake records it by playhead position (corrections are bypassed so it hears the raw mix) and draws it under the reference. |
-| **Pairs** | Drag across your track to mark a stretch, move the reference window to the bars it should sound like, press **+ PAIR**. Each pair gets its own colour on both waveforms, its own checks, fix cards and correction, measured from the fullest bars inside the stretch. Drag a pair's edges to resize; click it to select. Unmarked parts are left alone. |
+| **Pairs** | Press **+ PAIR** (or just drag across your track) and follow the two steps (see Phase 4). Each pair gets its own colour on both waveforms, its own checks, fix cards and correction, measured from the fullest bars inside the stretch. Drag a pair's edges to resize; click it to select. Unmarked parts are left alone. |
 | **AUTO-PAIR** | First guess: your drops to the reference's drop, your breakdowns (low sub or low-passed) to its breakdown. Pairs you make by hand always win. |
 | **Status lights** | Green, amber or red on every pair, so you can see which section needs work. |
 | **Readout per pair** | Click a pair: the checklist, cards, grid and diagnostics switch to it (saved from the learn pass). While that section plays, the readout is live. **FOLLOW** switches to whichever pair is playing; clicking a pair turns it off. |
-| **Reference A / B** | Two reference slots. A pair remembers which one it matches (select the pair, then click A or B). |
+| **Reference A / B** | Two reference slots. A pair remembers which one it matches; to move it, select it and press **EDIT**. |
 | **Sound check** | Kick type (attack, click, ring length, pitch drop) and bass pattern (rolling 16ths, 8ths, offbeat, gallop, reverse, held) come first: if they differ, the card tells you to swap the kick or change the pattern, because EQ can't fix that. |
 | **Note check** | Bass notes against your key and the reference's movement, and kick tuning against your key and bass. Advice only: you change it in Ableton or Serum. |
 | **Correction per pair** | MATCH (or MATCH ALL) works it out; the knobs adjust it: FEEL, PUNCH, ATTACK, TAIL, MUD (on the kick 16th only), LOW CUT, built-in DUCK per 16th, MONO, WEIGHT. It switches by playhead position with a one-beat glide. Every card says what Ground Shake is doing and how to do it yourself. |
@@ -44,6 +44,21 @@ A meter for the end of your master chain. It answers one question: **if you were
 The learned recording itself isn't saved with the project (it would be large): pairs, their results and corrections are. After reopening a set, press LEARN (or LEARN PAIR) before measuring new pairs.
 
 Readings that come from the finished master are estimates: the kick note in particular, and the rekordbox Auto Gain prediction. The cards say so.
+
+## Phase 4: line up, guided pairs, OUT lights, master check
+
+| Part | What it does |
+|---|---|
+| **Shared timeline** | The reference and your track sit on one bar ruler at the same bar width, so bars line up all the way across. Where one track has no audio, its lane is greyed out. |
+| **NUDGE < >** | Moves your track one bar left or right (**Shift**: one beat); **0** lines the starts up again. Only the view moves: pairs, corrections and the export stay on your real Ableton bars. Saved with the project. |
+| **Zoom** | Mouse wheel or pinch over the waveforms (Shift+wheel or a sideways swipe scrolls), or **- + FIT**. Zoomed in you see beats and 16ths and the real waveform. |
+| **Guided pairing** | **+ PAIR**: step 1, drag across the part of your track to fix; step 2, drag across the reference bars it should sound like (1, 2, 4 or 8 bars), or click a bar to start there with the current length, or **USE WINDOW**. **CANCEL** or Esc stops. Dragging on an empty part of your track starts at step 2 straight away. |
+| **EDIT** | Re-points the selected pair with the same two steps (**KEEP BARS** skips a step). Moving the reference window or clicking A / B never changes a pair any more. |
+| **MIX / OUT lights** | Every pair shows **MIX** (your mix) and, when its correction is on, **OUT** (with Ground Shake). OUT is worked out in the background by running the learned audio through the correction: no playback needed. MATCH's correction is also fine-tuned this way (level and ducking) until it lands on the reference. The lights are about the low end; limiter squash and DJ playback live in the MASTER view. |
+| **MIX / OUT / MASTER** | Chooses what the checklist and cards describe. While a pair plays, MIX reads your mix before the correction and OUT reads what comes out. Kick attack and click readings in OUT are estimates until you play the section (the learned audio is stored at about 16 kHz). |
+| **Master check** | Your drop against the reference's drop, level-matched: tone balance above 120 Hz, stereo width above 300 Hz, low-end mono, limiter squash (crest) and drop loudness. Advice cards for your master chain (EQ, imager, limiter), plus where each goes: EQ, imager, limiter, then Ground Shake last. Updates after each LEARN. |
+
+Phase 4 also fixes the built-in ducking, attack and tail bands: they now use a 1st-order split, so a cut is always a cut (the steeper split's phase could turn a duck into a small boost around 100 Hz).
 
 ## Use it in Ableton
 
