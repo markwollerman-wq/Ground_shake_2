@@ -44,6 +44,11 @@ int main (int argc, char* argv[])
                          gs::noteName (m.bassHz).toRawUTF8(), m.bassHz, m.bassConf, gs::noteName (m.kickHz).toRawUTF8(),
                          m.kickHz, m.kickConf, gs::keyName (m.keyIndex, m.keyMinor).toRawUTF8(), m.keyConf,
                          m.subCrestDb, m.lufs, m.peakDb);
+            std::printf ("   kick: %s (rise %.1f ms, click %.1f dB, decay %.0f ms, drop %.1f st from %.0f Hz)\n"
+                         "   bass: %s  levels %+.1f %+.1f %+.1f %+.1f  onsets %.1f %.1f %.1f | notes %s\n",
+                         m.kick.label().toRawUTF8(), m.kick.riseMs, m.kick.clickDb, m.kick.decayMs, m.kick.pitchDropSt, m.kick.startHz,
+                         gs::bassPatternName (m.bassPattern).toRawUTF8(), m.bassLevel[0], m.bassLevel[1], m.bassLevel[2], m.bassLevel[3],
+                         m.bassOnset[1], m.bassOnset[2], m.bassOnset[3], m.bassNotes.describe().toRawUTF8());
         }
     }
     return 0;

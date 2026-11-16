@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Universal binary")
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 
-project(GroundShake VERSION 0.2.1)
+project(GroundShake VERSION 0.3.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,7 @@ target_sources(GroundShake PRIVATE
     Source/Analysis.cpp
     Source/Checks.cpp
     Source/PluginProcessor.cpp
+    Source/PluginProcessorPairs.cpp
     Source/PluginEditor.cpp)
 
 target_compile_definitions(GroundShake PUBLIC
@@ -68,7 +69,7 @@ if(GS_BUILD_ANALYSIS_TEST)
     # end-to-end test: plugin processor + editor driven by a fake host, saves a screenshot
     juce_add_gui_app(GroundShakeRenderTest PRODUCT_NAME "GroundShakeRenderTest")
     target_sources(GroundShakeRenderTest PRIVATE
-        Source/Analysis.cpp Source/Checks.cpp Source/PluginProcessor.cpp Source/PluginEditor.cpp Tools/RenderTest.cpp)
+        Source/Analysis.cpp Source/Checks.cpp Source/PluginProcessor.cpp Source/PluginProcessorPairs.cpp Source/PluginEditor.cpp Tools/RenderTest.cpp)
     target_compile_definitions(GroundShakeRenderTest PRIVATE
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_MP3AUDIOFORMAT=1
         JucePlugin_Name="Ground Shake" JUCE_MODAL_LOOPS_PERMITTED=1)

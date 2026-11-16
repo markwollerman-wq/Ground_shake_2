@@ -1,4 +1,4 @@
-# WOLLER Ground Shake (Phase 2.1)
+# WOLLER Ground Shake (Phase 3)
 
 A meter for the end of your master chain. It answers one question: **if you were standing on a club floor, how much would your feet feel this sub, and does it match your reference track, every 16th of the way?** Phase 2 adds a coach that tells you what to change, in what order, and how.
 
@@ -24,6 +24,24 @@ A meter for the end of your master chain. It answers one question: **if you were
 | **Match** | MATCH works out a correction (feel and punch EQ, mono below 120 Hz, optional WEIGHT saturation), PREVIEW A/B plays it level-matched, APPLY keeps it, REVERT removes it. Its ceiling follows the peak level coming out of your limiter (fallback -1 dB). |
 | **A / B** | Flip between your mix and the reference, level-matched. |
 | **Pass-through** | With Match off and A selected, audio passes through completely untouched. |
+
+## Phase 3: pairs (the whole song)
+
+| Part | What it does |
+|---|---|
+| **Song start bar** | The Ableton bar your song starts on (default 9, remembered for every project). Below 1 = AUTO: the first bar with sound. |
+| **LEARN** | Press, then play your song in Ableton from the start bar to the end; press again (STOP). Ground Shake records it by playhead position (corrections are bypassed so it hears the raw mix) and draws it under the reference. |
+| **Pairs** | Drag across your track to mark a stretch, move the reference window to the bars it should sound like, press **+ PAIR**. Each pair gets its own colour on both waveforms, its own checks, fix cards and correction, measured from the fullest bars inside the stretch. Drag a pair's edges to resize; click it to select. Unmarked parts are left alone. |
+| **AUTO-PAIR** | First guess: your drops to the reference's drop, your breakdowns (low sub or low-passed) to its breakdown. Pairs you make by hand always win. |
+| **Status lights** | Green, amber or red on every pair, so you can see which section needs work. |
+| **Readout per pair** | Click a pair: the checklist, cards, grid and diagnostics switch to it (saved from the learn pass). While that section plays, the readout is live. **FOLLOW** switches to whichever pair is playing; clicking a pair turns it off. |
+| **Reference A / B** | Two reference slots. A pair remembers which one it matches (select the pair, then click A or B). |
+| **Sound check** | Kick type (attack, click, ring length, pitch drop) and bass pattern (rolling 16ths, 8ths, offbeat, gallop, reverse, held) come first: if they differ, the card tells you to swap the kick or change the pattern, because EQ can't fix that. |
+| **Note check** | Bass notes against your key and the reference's movement, and kick tuning against your key and bass. Advice only: you change it in Ableton or Serum. |
+| **Correction per pair** | MATCH (or MATCH ALL) works it out; the knobs adjust it: FEEL, PUNCH, ATTACK, TAIL, MUD (on the kick 16th only), LOW CUT, built-in DUCK per 16th, MONO, WEIGHT. It switches by playhead position with a one-beat glide. Every card says what Ground Shake is doing and how to do it yourself. |
+| **LEARN PAIR** | After a mix change, re-learn just the selected pair: press, play that section, it stops by itself. |
+
+The learned recording itself isn't saved with the project (it would be large): pairs, their results and corrections are. After reopening a set, press LEARN (or LEARN PAIR) before measuring new pairs.
 
 Readings that come from the finished master are estimates: the kick note in particular, and the rekordbox Auto Gain prediction. The cards say so.
 

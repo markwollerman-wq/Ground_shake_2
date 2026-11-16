@@ -73,6 +73,9 @@ juce::String checkName (CheckId id)
     switch (id)
     {
         case CheckId::section:    return "Right section";
+        case CheckId::kickType:   return "Kick type";
+        case CheckId::bassPattern:return "Bass pattern";
+        case CheckId::bassNotes:  return "Bass notes";
         case CheckId::mono:       return "Mono below 120 Hz";
         case CheckId::tuning:     return "Kick tuning";
         case CheckId::kickBass:   return "Kick / bass";
@@ -144,7 +147,7 @@ void Coach::takeSnapshot()
     snapValid = true;
 }
 
-void Coach::update (const CoachInputs& in, double nowSec)
+void Coach::update (const CoachInputs& in, double nowSec, bool holdForLoop)
 {
     rows.clear();
     fixCards.clear();
@@ -197,8 +200,8 @@ void Coach::update (const CoachInputs& in, double nowSec)
         if (refOk)
         {
             r.metric = in.windowVsDropDb;
-            r.st = (in.sectionDismissed || onDrop) ? Status::pass : grade (-in.windowVsDropDb, 2.0f, 4.0f);
-            r.value = bd ? juce::String ("breakdown") : onDrop ? juce::String ("drop")
+            r.st = (in.sectionDismissed || onDrop || in.pairMode) ? Status::pass : grade (-in.windowVsDropDb, 2.0f, 4.0f);
+            r.value = in.pairMode ? in.pairLabel : bd ? juce::String ("breakdown") : onDrop ? juce::String ("drop")
                          : "bars " + juce::String (firstBar) + dash + juce::String (lastBar);
             juce::ignoreUnused (onBreakdown);
             if (r.st != Status::pass && bd)
@@ -233,6 +236,181 @@ void Coach::update (const CoachInputs& in, double nowSec)
                 c.offerFindDrop = c.offerDismiss = true;
                 r.hasCard = true;  r.card = c;
             }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // SOUND CHECK: is it the right KIND of kick and bass? (advice only: mixing can't fix these)
+    if (bothM && in.youM.kick.valid && in.refM.kick.valid)
+    {
+        auto& r = raw[(size_t) CheckId::kickType];
+        const auto& yk = in.youM.kick;
+        const auto& rk = in.refM.kick;
+        const int lenD = std::abs (yk.lengthClass() - rk.lengthClass());
+        const int attD = std::abs (yk.attackClass() - rk.attackClass());
+        const int pitD = std::abs (yk.pitchClass() - rk.pitchClass());
+        const int score = lenD + attD + pitD + (yk.clicky() != rk.clicky() ? 1 : 0);
+        const float ratio = rk.decayMs > 0 ? yk.decayMs / rk.decayMs : 1.0f;
+        r.metric = (float) score;
+        r.value = score == 0 ? juce::String ("matches") : juce::String (score) + (score == 1 ? " trait off" : " traits off");
+        r.st = (score <= 1 && ratio > 0.65f && ratio < 1.5f) ? Status::pass : (score <= 2 ? Status::near : Status::fail);
+        if (r.st != Status::pass)
+        {
+            juce::StringArray want;
+            if (rk.lengthClass() < yk.lengthClass()) want.add ("a shorter decay (rings about " + juce::String (juce::roundToInt (rk.decayMs)) + " ms)");
+            if (rk.lengthClass() > yk.lengthClass()) want.add ("a longer, ringing tail (about " + juce::String (juce::roundToInt (rk.decayMs)) + " ms)");
+            if (rk.attackClass() < yk.attackClass()) want.add ("a harder, faster transient");
+            if (rk.attackClass() > yk.attackClass()) want.add ("a rounder, softer hit");
+            if (rk.clicky() && ! yk.clicky()) want.add ("more click on top");
+            if (! rk.clicky() && yk.clicky()) want.add ("less click on top");
+            if (rk.pitchClass() < yk.pitchClass()) want.add ("less pitch sweep (a flatter, tuned kick)");
+            if (rk.pitchClass() > yk.pitchClass()) want.add ("more pitch sweep from the hit");
+            auto c = newCard (CheckId::kickType, r.st == Status::fail ? "SWAP THE KICK" : "KICK CHARACTER DIFFERS",
+                              "yours: " + yk.label() + "  |  " + R + ": " + rk.label());
+            c.see = R + "'s kick is " + rk.label() + " (rings about " + juce::String (juce::roundToInt (rk.decayMs)) + " ms, attack "
+                    + juce::String (juce::roundToInt (rk.riseMs)) + " ms, pitch drop " + juce::String (rk.pitchDropSt, 0) + " st). Yours is "
+                    + yk.label() + " (" + juce::String (juce::roundToInt (yk.decayMs)) + " ms, " + juce::String (juce::roundToInt (yk.riseMs))
+                    + " ms, " + juce::String (yk.pitchDropSt, 0) + " st).";
+            c.cause = r.st == Status::fail ? "Different kick types: EQ and compression can't turn one into the other."
+                                           : "Close, but part of the kick's character differs.";
+            if (r.st == Status::fail)
+            {
+                c.how.add ("Swap the kick for one with " + want.joinIntoString (", ") + ".");
+                c.how.add ("Audition kicks in Drum Rack with this section playing, and watch this card.");
+                c.how.add ("Meanwhile, the Correction panel's ATTACK and TAIL controls can get you part of the way.");
+            }
+            else
+            {
+                c.how.add ("Look for " + want.joinIntoString (", ") + ", or shape it: a transient shaper or the kick's amp envelope.");
+                c.how.add ("Or use the Correction panel's ATTACK and TAIL controls.");
+            }
+            c.worked = "The Kick type check ticks.";
+            c.adviceOnly = true;
+            c.highlightMask = maskFor ({ 0 });
+            r.hasCard = true;  r.card = c;
+        }
+    }
+
+    if (bothM && in.youM.kick.valid && in.refM.kick.valid)
+    {
+        auto& r = raw[(size_t) CheckId::bassPattern];
+        const auto yp = in.youM.bassPattern, rp = in.refM.bassPattern;
+        if (yp == BassPattern::unknown || rp == BassPattern::unknown)
+        {
+            r.st = Status::info;
+            r.value = "unclear";
+        }
+        else
+        {
+            r.metric = yp == rp ? 0.0f : 1.0f;
+            r.value = yp == rp ? bassPatternName (yp) : juce::String ("differs");
+            r.st = yp == rp ? Status::pass : Status::fail;
+            if (r.st != Status::pass)
+            {
+                auto c = newCard (CheckId::bassPattern, "BASS PATTERN DIFFERS",
+                                  R + ": " + bassPatternName (rp) + "  |  yours: " + bassPatternName (yp));
+                c.see = R + "'s bass plays " + bassPatternName (rp) + "; yours plays " + bassPatternName (yp)
+                        + ". Mixing can't change the rhythm.";
+                c.cause = "The bass MIDI (or the bass loop) has a different rhythm.";
+                switch (rp)
+                {
+                    case BassPattern::rolling16:
+                        c.how.add ("In your bass MIDI, put a note on 16ths 2, 3 and 4 of every beat, each just under a 16th long. Leave 16th 1 for the kick.");
+                        c.how.add ("Serum: a short amp envelope (decay about one 16th) so each note speaks.");
+                        break;
+                    case BassPattern::rolling8:
+                        c.how.add ("Put one note on the offbeat 8th (16th 3) of every beat, held to the end of the beat.");
+                        break;
+                    case BassPattern::offbeat:
+                        c.how.add ("Put one short note on the offbeat (16th 3) of every beat and leave the rest empty.");
+                        break;
+                    case BassPattern::gallop:
+                        c.how.add ("Put notes on 16ths 3 and 4 of every beat.");
+                        break;
+                    case BassPattern::reverse:
+                        c.how.add ("Use a reverse bass: a sub note that swells up into each kick (reverse a bass hit, or a slow-attack envelope ending on the beat).");
+                        break;
+                    case BassPattern::sustained:
+                        c.how.add ("Use one held sub note instead of separate notes, and let the sidechain shape it.");
+                        break;
+                    case BassPattern::none:
+                        c.how.add (R + " leaves the space between the kicks empty here: mute the bass in this section.");
+                        break;
+                    case BassPattern::unknown:
+                    default: break;
+                }
+                c.how.add ("Then re-check: the beat-shape and sub cards only make sense once the rhythm matches.");
+                c.worked = "The Bass pattern check ticks.";
+                c.adviceOnly = true;
+                c.highlightMask = maskFor ({ 1, 2, 3 });
+                c.beatMask = beatBits ({ 1, 2, 3 });
+                c.beatGraph = true;
+                r.hasCard = true;  r.card = c;
+            }
+        }
+    }
+
+    // NOTE CHECK: bass notes against your key and the reference's movement (advice only)
+    if (bothM && in.youM.bassNotes.count > 0)
+    {
+        auto& r = raw[(size_t) CheckId::bassNotes];
+        const auto& yn = in.youM.bassNotes;
+        const auto& rn = in.refM.bassNotes;
+        static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+        auto nm = [] (int midi) { return juce::String (names[((midi % 12) + 12) % 12]) + juce::String (midi / 12 - 1); };
+        auto pc = [] (int midi) { return juce::String (names[((midi % 12) + 12) % 12]); };
+        const bool keyKnown = in.youM.keyIndex >= 0 && in.youM.keyConf >= 0.1f;    // only a clear key reading
+        int outNote = -1;
+        float outW = 0;
+        if (keyKnown)
+            for (int i = 0; i < yn.count; ++i)
+                if (yn.weight[(size_t) i] >= 0.25f && ! scaleContains (in.youM.keyIndex, in.youM.keyMinor, yn.midi[(size_t) i]))
+                { outNote = yn.midi[(size_t) i]; outW = yn.weight[(size_t) i]; break; }
+        int yDistinct = 0, rDistinct = 0;
+        for (int i = 0; i < yn.count; ++i) if (yn.weight[(size_t) i] >= 0.2f) ++yDistinct;
+        for (int i = 0; i < rn.count; ++i) if (rn.weight[(size_t) i] >= 0.2f) ++rDistinct;
+        juce::StringArray yParts;
+        for (int i = 0; i < juce::jmin (2, yn.count); ++i) yParts.add (nm (yn.midi[(size_t) i]));
+        r.value = yParts.joinIntoString ("/");
+        r.metric = outNote >= 0 ? 2.0f : (rDistinct >= 2 && yDistinct == 1 ? 1.0f : 0.0f);
+        r.st = outNote >= 0 ? Status::near : (rDistinct >= 2 && yDistinct == 1 ? Status::near : Status::pass);
+        if (outNote >= 0)
+        {
+            int down = outNote - 1, up = outNote + 1;
+            while (! scaleContains (in.youM.keyIndex, in.youM.keyMinor, down)) --down;
+            while (! scaleContains (in.youM.keyIndex, in.youM.keyMinor, up)) ++up;
+            auto c = newCard (CheckId::bassNotes, "BASS NOTE OUT OF KEY", nm (outNote) + " isn't in " + keyName (in.youM.keyIndex, in.youM.keyMinor));
+            c.see = nm (outNote) + " (about " + juce::String (juce::roundToInt (outW * 100.0f)) + "% of your bass here) isn't in "
+                    + keyName (in.youM.keyIndex, in.youM.keyMinor) + ", the key the rest of your track reads in. Your bass plays "
+                    + yn.describe() + ".";
+            c.cause = "A wrong note in the bass MIDI, or a bass patch tuned off.";
+            c.how.add ("Move it to " + pc (down) + " or " + pc (up) + ", the nearest notes in the key.");
+            c.how.add ("If it's on purpose (a passing note), ignore this card: it's a reading of the finished mix.");
+            c.worked = "The Bass notes check ticks.";
+            c.adviceOnly = true;
+            r.hasCard = true;  r.card = c;
+        }
+        else if (r.st == Status::near)
+        {
+            juce::StringArray rParts;
+            for (int i = 0; i < rn.count; ++i) if (rn.weight[(size_t) i] >= 0.2f) rParts.add (nm (rn.midi[(size_t) i]));
+            auto c = newCard (CheckId::bassNotes, "YOUR BASS STAYS ON ONE NOTE",
+                              R + " moves between " + rParts.joinIntoString (" and ") + "; yours stays on " + nm (yn.midi[0]));
+            c.see = R + "'s bass moves between " + rParts.joinIntoString (" and ") + " here; yours stays on " + nm (yn.midi[0]) + ".";
+            c.cause = "A one-note bass line where the reference has movement.";
+            if (keyKnown)
+            {
+                const int root = in.youM.keyIndex;
+                const int third = root + (in.youM.keyMinor ? 3 : 4), fifth = root + 7;
+                c.how.add ("Add movement in the bass MIDI: try your key's 3rd (" + juce::String (names[third % 12]) + ") or 5th ("
+                           + juce::String (names[fifth % 12]) + ") every other bar, or on the last beat of the bar.");
+            }
+            else
+                c.how.add ("Add movement in the bass MIDI: a second note every other bar, or on the last beat of the bar.");
+            c.how.add ("Optional: a one-note bass can be a choice. This card is a reading, not a rule.");
+            c.worked = "The Bass notes check ticks.";
+            c.adviceOnly = true;
+            r.hasCard = true;  r.card = c;
         }
     }
 
@@ -295,6 +473,8 @@ void Coach::update (const CoachInputs& in, double nowSec)
                 c.cause = "The kick sample's pitch doesn't follow the bass note.";
                 c.how.add ("Tune the kick about " + juce::String (move > 0 ? "+" : "") + juce::String (move == 0 ? (dev > 0 ? -1 : 1) : move)
                            + " semitones (Simpler or Sampler: Transpose, or your kick synth's pitch).");
+                if (y.keyIndex >= 0 && y.keyConf >= 0.05f)
+                    c.how.add ("Your track reads in " + keyName (y.keyIndex, y.keyMinor) + ": a kick that settles on its root or 5th sits best.");
                 c.how.add ("Listen with the bass: the kick's tail should blend into the bass note, not beat against it.");
                 c.how.add ("This is an estimate from the finished mix. If your ears disagree, trust them.");
                 c.worked = "The Kick tuning check ticks (within about half a semitone).";
@@ -785,7 +965,8 @@ void Coach::update (const CoachInputs& in, double nowSec)
     // Breakdown mode: ducking, kick tuning and limiter-squash advice don't apply to a section
     // that's meant to have no sub
     if (bd)
-        for (auto id : { CheckId::tuning, CheckId::kickBass, CheckId::beatShape, CheckId::squash, CheckId::djPlayback })
+        for (auto id : { CheckId::kickType, CheckId::bassNotes, CheckId::tuning, CheckId::kickBass, CheckId::beatShape,
+                         CheckId::squash, CheckId::djPlayback })
         {
             auto& r = raw[(size_t) id];
             if (r.st == Status::waiting) continue;
@@ -810,7 +991,7 @@ void Coach::update (const CoachInputs& in, double nowSec)
         if (r.st == Status::pass)
         {
             if (t.passSince < 0) t.passSince = nowSec;
-            t.ticked = t.ticked || (nowSec - t.passSince) >= loopSec;
+            t.ticked = t.ticked || ! holdForLoop || (nowSec - t.passSince) >= loopSec;
             shown = t.ticked ? Status::pass : Status::holding;
         }
         else

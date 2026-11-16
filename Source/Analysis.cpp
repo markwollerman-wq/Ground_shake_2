@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <map>
 
 namespace gs
 {
@@ -31,6 +32,14 @@ void Biquad::setPeak (double sr, double f, double q, double gainDb)
     const double a0 = 1.0 + alpha / A;
     b0 = (1.0 + alpha * A) / a0;  b1 = -2.0 * c / a0;  b2 = (1.0 - alpha * A) / a0;
     a1 = -2.0 * c / a0;           a2 = (1.0 - alpha / A) / a0;
+}
+
+void Biquad::setBandPass (double sr, double f, double q)
+{
+    const double w0 = juce::MathConstants<double>::twoPi * f / sr;
+    const double c = std::cos (w0), alpha = std::sin (w0) / (2.0 * q), a0 = 1.0 + alpha;
+    b0 = alpha / a0;  b1 = 0.0;  b2 = -alpha / a0;
+    a1 = -2.0 * c / a0;  a2 = (1.0 - alpha) / a0;
 }
 
 void BandSplitter::prepare (double sr, float split, float feelLo)
@@ -412,6 +421,20 @@ float windowLevelDb (const ReferenceTrack& ref, double bpm, double gridOffsetSec
     return powerToDb ((float) (s / (double) (i1 - i0)));
 }
 
+float windowEnvDb (const ReferenceTrack& ref, const std::vector<float>& env, double bpm, double gridOffsetSec,
+                   int startBar, int bars)
+{
+    if (bpm <= 0 || env.empty()) return -100.0f;
+    const double hopSec = ref.hop / ref.sampleRate, barSec = 240.0 / bpm;
+    const double t0 = ref.firstDownbeatSec + gridOffsetSec + startBar * barSec;
+    const long i0 = std::max (0L, (long) (t0 / hopSec));
+    const long i1 = std::min ((long) env.size(), (long) ((t0 + bars * barSec) / hopSec));
+    if (i1 <= i0) return -100.0f;
+    double s = 0;
+    for (long i = i0; i < i1; ++i) s += env[(size_t) i];
+    return powerToDb ((float) (s / (double) (i1 - i0)));
+}
+
 int findDropBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int bars)
 {
     const int barsAvail = numBarsInReference (ref, bpm, gridOffsetSec);
@@ -582,6 +605,24 @@ Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int
     std::vector<float> subFrames;
     double sLL = 0, sRR = 0, sLR = 0, sMid = 0, sSide = 0, acc = 0;
     int accN = 0;
+    // 1 ms envelopes for the kick and bass shape: the low thump (40-250 Hz) and the click (2-5 kHz)
+    Biquad k1, k2, k3, k4, c1, c2, c3, c4, t1, t2, t3, t4;
+    t1.setHighPass (sr, 150.0); t2.setHighPass (sr, 150.0);
+    t3.setLowPass (sr, std::min (5000.0, sr * 0.45)); t4.setLowPass (sr, std::min (5000.0, sr * 0.45));
+    k1.setHighPass (sr, 40.0);  k2.setHighPass (sr, 40.0);  k3.setLowPass (sr, 250.0);  k4.setLowPass (sr, 250.0);
+    const bool haveClick = sr >= 11000.0;
+    if (haveClick)
+    {
+        c1.setHighPass (sr, 2000.0); c2.setHighPass (sr, 2000.0);
+        c3.setLowPass (sr, std::min (5000.0, sr * 0.45)); c4.setLowPass (sr, std::min (5000.0, sr * 0.45));
+    }
+    const int msHop = juce::jmax (1, (int) std::round (sr / 1000.0));
+    std::vector<float> thumpMs, clickMs, transMs;
+    transMs.reserve ((size_t) (length / msHop + 1));
+    thumpMs.reserve ((size_t) (length / msHop + 1));
+    clickMs.reserve ((size_t) (length / msHop + 1));
+    double thAcc = 0, clAcc = 0, trAcc = 0;
+    int msN = 0;
     for (int i = 0; i < length; ++i)
     {
         const float lo = l2.process (l1.process (L[i])), ro = r2.process (r1.process (R[i]));
@@ -597,6 +638,19 @@ Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int
 
         const float dl = d2.process (d1.process (mono));
         if (i % D == 0) low.push_back (dl);
+
+        const float th = k4.process (k3.process (k2.process (k1.process (mono))));
+        thAcc += (double) th * th;
+        const float tr = t4.process (t3.process (t2.process (t1.process (mono))));
+        trAcc += (double) tr * tr;
+        if (haveClick) { const float cl = c4.process (c3.process (c2.process (c1.process (mono)))); clAcc += (double) cl * cl; }
+        if (++msN == msHop)
+        {
+            thumpMs.push_back ((float) (thAcc / msHop));
+            clickMs.push_back ((float) (clAcc / msHop));
+            transMs.push_back ((float) (trAcc / msHop));
+            thAcc = clAcc = trAcc = 0;  msN = 0;
+        }
     }
     if (sLL > 1e-12 && sRR > 1e-12)
     {
@@ -742,8 +796,227 @@ Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int
         }
     }
 
+    // --- the sound itself: kick character, bass pattern, bass notes
+    if (beatLen > 0 && thumpMs.size() > 200)
+    {
+        const double msPerSample = 1000.0 / sr;
+        const double beatMs = beatLen * msPerSample, sixteenthMs = beatMs / 4.0;
+        // 1 ms power frames swing with every cycle of a 50 Hz wave: smooth them first
+        auto smooth = [] (const std::vector<float>& v, int w)
+        {
+            std::vector<float> o (v.size());
+            double sum = 0;
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                sum += v[i];
+                if (i >= (size_t) w) sum -= v[i - (size_t) w];
+                o[i] = (float) (sum / std::min ((size_t) w, i + 1));
+            }
+            // centre the window
+            std::vector<float> c (v.size());
+            for (size_t i = 0; i < v.size(); ++i) c[i] = o[std::min (v.size() - 1, i + (size_t) w / 2)];
+            return c;
+        };
+        // the attack is timed on the 150 Hz-5 kHz transient (the sub is too slow to show it);
+        // the ring and the bass levels on the smoothed thump
+        const auto env5 = smooth (transMs, 2), env12 = smooth (thumpMs, 15), click3 = smooth (clickMs, 3);
+        const int nMs = (int) thumpMs.size();
+        auto envAt = [&] (const std::vector<float>& v, int i) { return v[(size_t) juce::jlimit (0, nMs - 1, i)]; };
+        auto maxIn = [&] (const std::vector<float>& v, int a, int b)
+        {
+            float mx = 0;
+            for (int i = juce::jmax (0, a); i <= juce::jmin (nMs - 1, b); ++i) mx = std::max (mx, v[(size_t) i]);
+            return mx;
+        };
+        auto meanIn = [&] (const std::vector<float>& v, int a, int b)
+        {
+            double sum = 0;
+            int c = 0;
+            for (int i = juce::jmax (0, a); i <= juce::jmin (nMs - 1, b); ++i) { sum += v[(size_t) i]; ++c; }
+            return c > 0 ? (float) (sum / c) : 0.0f;
+        };
+        auto median = [] (std::vector<float> v)
+        {
+            if (v.empty()) return 0.0f;
+            std::nth_element (v.begin(), v.begin() + (long) (v.size() / 2), v.end());
+            return v[v.size() / 2];
+        };
+        auto db = [] (float p) { return 10.0f * std::log10 (std::max (p, 1.0e-12f)); };
+        auto zcrHz = [&] (int fromMs, int toMs)        // zero-crossing pitch of the low band (decimated)
+        {
+            const int a = (int) (fromMs / 1000.0 * dsr), b = (int) (toMs / 1000.0 * dsr);
+            if (a < 1 || b >= (int) low.size() || b - a < 8) return 0.0f;
+            int z = 0;
+            for (int i = a + 1; i <= b; ++i) if ((low[(size_t) i - 1] < 0) != (low[(size_t) i] < 0)) ++z;
+            return (float) (z / (2.0 * (b - a) / dsr));
+        };
+
+        std::vector<float> rise, decay, click, drop, startHz;
+        std::array<std::vector<float>, 4> lev, ons;
+        std::map<int, double> noteWeight;
+        constexpr int nfftOrder = 13, nfft = 1 << nfftOrder;
+        juce::dsp::FFT nfftObj (nfftOrder);
+        std::vector<float> nb ((size_t) nfft * 2);
+
+        for (double b = firstBeat; b + beatLen < length; b += beatLen)
+        {
+            const int g = (int) (b * msPerSample);
+            const float mx = maxIn (env5, g - 20, g + 80);
+            if (mx <= 1.0e-10f) continue;
+            // the hit starts where the thump climbs out of the dip before it
+            float base = 1.0e9f;
+            for (int i = g - 30; i <= g + 5; ++i) base = std::min (base, envAt (env5, i));
+            int onset = g;
+            for (int i = juce::jmax (0, g - 20); i <= g + 40; ++i)
+                if (envAt (env5, i) >= base + 0.3f * (mx - base)) { onset = i; break; }
+
+            // kick: attack, ring, click, pitch sweep
+            int pk = onset;
+            float peak = 0;
+            for (int i = onset - 10; i <= onset + 60; ++i) if (envAt (env5, i) > peak) { peak = envAt (env5, i); pk = i; }
+            int i10 = onset, i90 = pk;
+            for (int i = onset - 20; i <= pk; ++i) if (envAt (env5, i) >= base + 0.1f * (peak - base)) { i10 = i; break; }
+            for (int i = i10; i <= pk; ++i) if (envAt (env5, i) >= base + 0.9f * (peak - base)) { i90 = i; break; }
+            rise.push_back ((float) (i90 - i10));
+            // ring: from the smoothed thump's peak down 12 dB (the bass coming back can cut it short)
+            float peak12 = 0;
+            int pk12 = onset;
+            for (int i = onset; i <= onset + 60; ++i) if (envAt (env12, i) > peak12) { peak12 = envAt (env12, i); pk12 = i; }
+            const int limit = onset + (int) (0.6 * beatMs);
+            int iDecay = limit;
+            for (int i = pk12; i <= limit; ++i) if (envAt (env12, i) <= peak12 * 0.063f) { iDecay = i; break; }
+            decay.push_back ((float) (iDecay - onset));
+            if (haveClick) click.push_back (db (maxIn (click3, onset - 5, onset + 25)) - db (peak));
+            const float f1 = zcrHz (onset + 2, onset + 30), f2 = zcrHz (onset + 60, onset + 140);
+            if (f1 > 20 && f2 > 20) { drop.push_back (12.0f * std::log2 (f1 / f2)); startHz.push_back (f1); }
+
+            // bass: level and note starts on 16ths 2-4 (16th 1 belongs to the kick)
+            const float l0 = meanIn (env12, onset + 5, onset + (int) sixteenthMs - 5);
+            lev[0].push_back (db (l0));
+            float prevLevel = db (l0);
+            for (int k = 1; k < 4; ++k)
+            {
+                const int t = onset + (int) (k * sixteenthMs);
+                lev[(size_t) k].push_back (db (meanIn (env12, t + 10, t + (int) sixteenthMs - 10)));
+                const float before = std::max (1.0e-12f, [&] { float mn = 1e9f; for (int i = t - 25; i <= t + 3; ++i) mn = std::min (mn, envAt (env12, i)); return mn; }());
+                // a real note start comes back up near the previous note's level; a kick tail
+                // peeking out of the gap after a note ends does not
+                const float after = db (maxIn (env12, t + 8, t + 40));
+                ons[(size_t) k].push_back (after >= prevLevel - 6.0f ? after - db (before) : 0.0f);
+                prevLevel = lev[(size_t) k].back();
+            }
+
+            // bass note between the kicks (the second half of the beat, clear of the kick's tail)
+            {
+                const int a = (int) ((b + beatLen * 0.4) / D), w = juce::jmin ((int) (0.6 * beatLen / D), nfft);
+                if (a + w < (int) low.size() && w > 64)
+                {
+                    std::fill (nb.begin(), nb.end(), 0.0f);
+                    double energy = 0;
+                    for (int i = 0; i < w; ++i)
+                    {
+                        const float x = low[(size_t) (a + i)];
+                        energy += (double) x * x;
+                        nb[(size_t) i] = x * (0.5f - 0.5f * std::cos (juce::MathConstants<float>::twoPi * (float) i / (float) (w - 1)));
+                    }
+                    nfftObj.performFrequencyOnlyForwardTransform (nb.data());
+                    std::vector<double> pw ((size_t) nfft / 2);
+                    for (int i = 0; i < nfft / 2; ++i) pw[(size_t) i] = (double) nb[(size_t) i] * nb[(size_t) i];
+                    float hz = 0, conf = 0;
+                    spectrumPeak (pw, dsr / nfft, 28.0f, 90.0f, hz, conf);
+                    if (hz > 0 && conf >= 3.0f)
+                        noteWeight[(int) std::round (69.0 + 12.0 * std::log2 (hz / 440.0))] += energy;
+                }
+            }
+        }
+
+        if (rise.size() >= 4)
+        {
+            m.kick.valid = true;
+            m.kick.riseMs = median (rise);
+            m.kick.decayMs = median (decay);
+            m.kick.clickDb = haveClick ? median (click) : -40.0f;
+            m.kick.pitchDropSt = drop.size() >= 4 ? std::max (0.0f, median (drop)) : 0.0f;
+            m.kick.startHz = startHz.empty() ? 0.0f : median (startHz);
+
+            std::array<float, 4> L4 {}, O4 {};
+            for (size_t k = 0; k < 4; ++k) { L4[k] = median (lev[k]); O4[k] = k > 0 ? median (ons[k]) : 0.0f; }
+            for (size_t k = 0; k < 4; ++k) { m.bassLevel[k] = L4[k] - L4[0]; m.bassOnset[k] = O4[k]; }
+            const float maxL = std::max ({ L4[1], L4[2], L4[3] }), minL = std::min ({ L4[1], L4[2], L4[3] });
+            const bool on1 = O4[1] >= 3.0f, on2 = O4[2] >= 3.0f, on3 = O4[3] >= 3.0f;
+            if (maxL < L4[0] - 20.0f)                                          m.bassPattern = BassPattern::none;
+            else if (L4[3] - L4[1] >= 5.0f && L4[2] >= L4[1] && ! on2 && ! on3)  m.bassPattern = BassPattern::reverse;
+            else if (on1 && on2 && on3 && maxL - minL <= 8.0f)                 m.bassPattern = BassPattern::rolling16;
+            else if (! on1 && on2 && on3)    // a note on 16th 2 can hide under the kick's tail
+                m.bassPattern = std::abs (L4[1] - L4[2]) <= 3.0f ? BassPattern::rolling16 : BassPattern::gallop;
+            else if (on2 && ! on1 && ! on3)  m.bassPattern = L4[3] >= L4[2] - 4.0f ? BassPattern::rolling8 : BassPattern::offbeat;
+            else if (! on1 && ! on2 && ! on3 && maxL - minL <= 6.0f)           m.bassPattern = BassPattern::sustained;
+            else                                                              m.bassPattern = BassPattern::unknown;
+        }
+
+        double total = 0;
+        for (auto& [n, w] : noteWeight) total += w;
+        std::vector<std::pair<double, int>> notes;
+        for (auto& [n, w] : noteWeight) notes.push_back ({ w, n });
+        std::sort (notes.begin(), notes.end(), [] (auto& a, auto& b2) { return a.first > b2.first; });
+        for (auto& [w, n] : notes)
+        {
+            if (m.bassNotes.count >= 4 || total <= 0 || w / total < 0.10) break;
+            m.bassNotes.midi[(size_t) m.bassNotes.count] = n;
+            m.bassNotes.weight[(size_t) m.bassNotes.count] = (float) (w / total);
+            ++m.bassNotes.count;
+        }
+    }
+
     m.valid = true;
     return m;
+}
+
+//==============================================================================
+juce::String KickCharacter::label() const
+{
+    if (! valid) return "--";
+    static const char* len[] = { "short", "medium length", "long tail" };
+    static const char* att[] = { "sharp", "medium attack", "soft attack" };
+    static const char* pit[] = { "flat pitch", "some pitch drop", "big pitch drop" };
+    return juce::String (len[lengthClass()]) + ", " + att[attackClass()] + (clicky() ? " click" : "") + ", " + pit[pitchClass()];
+}
+
+juce::String bassPatternName (BassPattern p)
+{
+    switch (p)
+    {
+        case BassPattern::none:      return "no bass between the kicks";
+        case BassPattern::sustained: return "a held sub note";
+        case BassPattern::rolling16: return "rolling 16ths";
+        case BassPattern::rolling8:  return "rolling 8ths";
+        case BassPattern::offbeat:   return "an offbeat bass";
+        case BassPattern::reverse:   return "a reverse bass";
+        case BassPattern::gallop:    return "a gallop (notes on 16ths 3 and 4)";
+        case BassPattern::unknown:
+        default:                     return "a mixed pattern";
+    }
+}
+
+juce::String BassNotes::describe() const
+{
+    if (count == 0) return "--";
+    static const char* n[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+    juce::StringArray parts;
+    for (int i = 0; i < count; ++i)
+        parts.add (juce::String (n[((midi[(size_t) i] % 12) + 12) % 12]) + juce::String (midi[(size_t) i] / 12 - 1) + " "
+                   + juce::String (juce::roundToInt (weight[(size_t) i] * 100.0f)) + "%");
+    return parts.joinIntoString (", ");
+}
+
+bool scaleContains (int keyIndex, bool minor, int midiNote)
+{
+    if (keyIndex < 0) return true;
+    static const int majorSteps[] = { 0, 2, 4, 5, 7, 9, 11 }, minorSteps[] = { 0, 2, 3, 5, 7, 8, 10 };
+    const int rel = (((midiNote - keyIndex) % 12) + 12) % 12;
+    const int* steps = minor ? minorSteps : majorSteps;
+    for (int i = 0; i < 7; ++i) if (steps[i] == rel) return true;
+    return false;
 }
 
 //==============================================================================
@@ -826,4 +1099,149 @@ StepProfile LiveStepMeter::profile() const
     p.valid = true;
     return p;
 }
+//==============================================================================
+//  SongRecorder (the learn pass)
+//==============================================================================
+SongRecorder::SongRecorder()
+{
+    ovMin.assign ((size_t) kMaxBars * kOverviewPerBar, 0.0f);
+    ovMax.assign ((size_t) kMaxBars * kOverviewPerBar, 0.0f);
+    heard.assign ((size_t) kMaxBars, 0);
+    for (auto& c : chunkL) c.store (nullptr);
+    for (auto& c : chunkR) c.store (nullptr);
+}
+
+void SongRecorder::prepare (double hostSampleRate)
+{
+    if (std::abs (hostSampleRate - hostSr) < 0.5 && chunkLen > 0) return;
+    hostSr = hostSampleRate;
+    D = juce::jmax (1, (int) std::round (hostSr / 16000.0));
+    dsr = hostSr / D;
+    chunkLen = (int) (kChunkSec * dsr);
+    for (auto* b : { &aL1, &aL2, &aR1, &aR2 }) b->setLowPass (hostSr, dsr * 0.45);
+    clear();
+}
+
+void SongRecorder::clear()
+{
+    for (auto& c : chunkL) c.store (nullptr);
+    for (auto& c : chunkR) c.store (nullptr);
+    storeL.clear();
+    storeR.clear();
+    std::fill (ovMin.begin(), ovMin.end(), 0.0f);
+    std::fill (ovMax.begin(), ovMax.end(), 0.0f);
+    std::fill (heard.begin(), heard.end(), (uint8_t) 0);
+    maxBar.store (-1);
+    bpm.store (0.0);
+    lastIdx.store (-1);
+    prevIdx = -1;
+    tempoChanged.store (false);
+    for (auto* b : { &aL1, &aL2, &aR1, &aR2 }) b->reset();
+}
+
+void SongRecorder::forgetBars (int from, int to)
+{
+    for (int b = juce::jmax (0, from); b < juce::jmin (kMaxBars, to); ++b)
+    {
+        heard[(size_t) b] = 0;
+        for (int p = 0; p < kOverviewPerBar; ++p)
+            ovMin[(size_t) (b * kOverviewPerBar + p)] = ovMax[(size_t) (b * kOverviewPerBar + p)] = 0.0f;
+    }
+}
+
+void SongRecorder::ensureChunksAround (double songSec)
+{
+    if (chunkLen <= 0) return;
+    const int c0 = juce::jmax (0, (int) (songSec / kChunkSec) - 1);
+    const int c1 = juce::jmin (kMaxChunks - 1, (int) ((songSec + 60.0) / kChunkSec));
+    if ((int) storeL.size() < kMaxChunks) { storeL.resize ((size_t) kMaxChunks); storeR.resize ((size_t) kMaxChunks); }
+    for (int c = c0; c <= c1; ++c)
+        if (storeL[(size_t) c] == nullptr)
+        {
+            storeL[(size_t) c].reset (new float[(size_t) chunkLen]());
+            storeR[(size_t) c].reset (new float[(size_t) chunkLen]());
+            chunkL[(size_t) c].store (storeL[(size_t) c].get());
+            chunkR[(size_t) c].store (storeR[(size_t) c].get());
+        }
+}
+
+void SongRecorder::process (const float* L, const float* R, int n, double songBeat, double beatsPerSample, double bpmNow) noexcept
+{
+    if (chunkLen <= 0) return;
+    const double b0 = bpm.load();
+    if (b0 <= 0.0) bpm.store (bpmNow);
+    else if (std::abs (b0 - bpmNow) > 0.05) { tempoChanged.store (true); return; }
+    const double secPerBeat = 60.0 / bpm.load();
+    for (int i = 0; i < n; ++i)
+    {
+        const float l = aL2.process (aL1.process (L[i])), r = aR2.process (aR1.process (R[i]));
+        const double beat = songBeat + i * beatsPerSample;
+        if (beat < 0.0) continue;
+        const int bar = (int) (beat / 4.0);
+        if (bar >= kMaxBars) return;
+        const long long idx = (long long) (beat * secPerBeat * dsr);
+        if (idx != prevIdx)
+        {
+            prevIdx = idx;
+            const int c = (int) (idx / chunkLen), off = (int) (idx % chunkLen);
+            if (c < kMaxChunks)
+                if (float* cl = chunkL[(size_t) c].load())
+                {
+                    cl[off] = l;
+                    chunkR[(size_t) c].load()[off] = r;
+                    if (idx > lastIdx.load()) lastIdx.store (idx);
+                }
+        }
+        const float m = 0.5f * (l + r);
+        const auto p = (size_t) (bar * kOverviewPerBar + juce::jlimit (0, kOverviewPerBar - 1, (int) ((beat / 4.0 - bar) * kOverviewPerBar)));
+        if (heard[(size_t) bar] == 0) { heard[(size_t) bar] = 1; ovMin[p] = ovMax[p] = 0.0f; }
+        ovMin[p] = std::min (ovMin[p], m);
+        ovMax[p] = std::max (ovMax[p], m);
+        if (bar > maxBar.load()) maxBar.store (bar);
+    }
+}
+
+int SongRecorder::firstAudibleBar() const
+{
+    for (int b = 0; b <= maxBar.load() && b < kMaxBars; ++b)
+    {
+        if (heard[(size_t) b] == 0) continue;
+        for (int p = 0; p < kOverviewPerBar; ++p)
+            if (ovMax[(size_t) (b * kOverviewPerBar + p)] > 0.003f || ovMin[(size_t) (b * kOverviewPerBar + p)] < -0.003f)
+                return b;
+    }
+    return 0;
+}
+
+bool SongRecorder::buildTrack (ReferenceTrack& out, int fromBar, float split) const
+{
+    const double b = bpm.load();
+    const long long last = lastIdx.load();
+    if (b <= 0 || last <= 0 || chunkLen <= 0) return false;
+    const double barSamples = 240.0 / b * dsr;
+    const long long start = (long long) (fromBar * barSamples);
+    const long long len = last + 1 - start;
+    if (len < (long long) (dsr * 1.0)) return false;
+    out = ReferenceTrack();
+    out.name = "Your track (learned)";
+    out.sampleRate = dsr;
+    out.audio.setSize (2, (int) len);
+    out.audio.clear();
+    for (long long i = 0; i < len; ++i)
+    {
+        const long long idx = start + i;
+        const int c = (int) (idx / chunkLen), off = (int) (idx % chunkLen);
+        if (c >= kMaxChunks) break;
+        if (const float* cl = chunkL[(size_t) c].load())
+        {
+            out.audio.setSample (0, (int) i, cl[off]);
+            out.audio.setSample (1, (int) i, chunkR[(size_t) c].load()[off]);
+        }
+    }
+    computeEnvelopes (out, split);
+    out.detectedBpm = b;
+    out.firstDownbeatSec = 0.0;
+    return true;
+}
+
 } // namespace gs

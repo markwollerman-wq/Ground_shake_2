@@ -3,6 +3,8 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <array>
 #include <vector>
+#include <atomic>
+#include <memory>
 
 // =============================================================================
 //  Ground Shake - analysis engine (no UI, no plugin code)
@@ -36,6 +38,7 @@ struct Biquad
     void setLowPass  (double sr, double f, double q = 0.70710678);
     void setHighPass (double sr, double f, double q = 0.70710678);
     void setPeak     (double sr, double f, double q, double gainDb);
+    void setBandPass (double sr, double f, double q);      // 0 dB at the centre
     void setRaw (double nb0, double nb1, double nb2, double na1, double na2) { b0 = nb0; b1 = nb1; b2 = nb2; a1 = na1; a2 = na2; }
     void reset() { z1 = z2 = 0; }
 
@@ -88,6 +91,37 @@ struct StepProfile
 float powerToDb (float p) noexcept;
 
 //------------------------------------------------------------------------------
+// What kind of kick it is (measured on the kick hits, averaged over the beats)
+struct KickCharacter
+{
+    bool valid = false;
+    float riseMs = 0;               // attack: 10% -> 90% of the low thump
+    float clickDb = -40;            // 2-5 kHz click at the hit, against the low thump
+    float decayMs = 0;              // how long the low end rings: time to fall 12 dB
+    float pitchDropSt = 0;          // pitch sweep from the hit to the tail, in semitones
+    float startHz = 0;              // pitch at the hit
+
+    int attackClass() const { return riseMs <= 6.0f ? 0 : (riseMs <= 14.0f ? 1 : 2); }       // sharp / medium / soft
+    int lengthClass() const { return decayMs <= 110.0f ? 0 : (decayMs <= 220.0f ? 1 : 2); }  // short / medium / long tail
+    int pitchClass() const  { return pitchDropSt <= 4.0f ? 0 : (pitchDropSt <= 10.0f ? 1 : 2); } // flat / some / big drop
+    bool clicky() const     { return clickDb >= -14.0f; }
+    juce::String label() const;     // "short, sharp, flat pitch"
+};
+
+// How the bass moves between the kicks
+enum class BassPattern { unknown, none, sustained, rolling16, rolling8, offbeat, reverse, gallop };
+juce::String bassPatternName (BassPattern);       // "rolling 16ths"
+
+// The notes the bass plays (strongest first), as MIDI note numbers with their share of the bass
+struct BassNotes
+{
+    std::array<int, 4> midi { -1, -1, -1, -1 };
+    std::array<float, 4> weight {};
+    int count = 0;
+    juce::String describe() const;  // "A1 70%, C2 30%"
+};
+
+//------------------------------------------------------------------------------
 // Slower, "whole picture" measurements of an 8-bar stretch of audio. The same function
 // measures the reference window and your live loop, so the two are always comparable.
 struct Measurements
@@ -106,7 +140,14 @@ struct Measurements
     // share of the whole mix per band (dB): how a sound was filtered
     enum Band { bSub, bPunch, bBody, bMid, bHigh, numBands };   // 20-60, 60-120, 120-300, 300-2k, 2k-10k Hz
     std::array<float, numBands> bandDb {};
+    // Phase 3: the sound itself
+    KickCharacter kick;
+    BassPattern bassPattern = BassPattern::unknown;
+    std::array<float, 4> bassLevel {}, bassOnset {};   // per 16th within the beat (dB), and how clearly a note starts there
+    BassNotes bassNotes;
 };
+
+bool scaleContains (int keyIndex, bool minor, int midiNote);     // is the note in the (natural minor / major) key?
 
 // start/length in samples; firstBeat = samples from `start` to the first beat; beatLen in samples
 Measurements measureAudio (const juce::AudioBuffer<float>& audio, int start, int length, double sampleRate,
@@ -161,6 +202,10 @@ int numBarsInReference (const ReferenceTrack& ref, double bpm, double gridOffset
 // Mean full-band power (dB) of `bars` bars starting at startBar
 float windowLevelDb (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int startBar, int bars = kBars);
 
+// Mean level (dB) of one of the track's envelopes over a window, e.g. clickEnv for brightness
+float windowEnvDb (const ReferenceTrack& ref, const std::vector<float>& env, double bpm, double gridOffsetSec,
+                   int startBar, int bars);
+
 // The drop: the earliest window within 0.2 dB of the loudest, fullest one (bar index)
 int findDropBar (const ReferenceTrack& ref, double bpm, double gridOffsetSec, int bars = kBars);
 
@@ -191,4 +236,50 @@ private:
     long serial = 0;                         // counts finished slots; old ones drop out after one loop
     int loopSteps = kLoopSteps;
 };
+//------------------------------------------------------------------------------
+// The learn pass: records YOUR song as Ableton plays it, placed by the playhead's position,
+// at a reduced rate (~16 kHz is plenty for low-end analysis). Re-playing a part simply
+// overwrites it. The audio thread only writes into chunks the message thread allocated
+// ahead of the playhead.
+class SongRecorder
+{
+public:
+    static constexpr int kMaxBars = 1024, kOverviewPerBar = 32, kChunkSec = 20, kMaxChunks = 150;
+
+    SongRecorder();
+    void prepare (double hostSampleRate);        // message thread, not while recording
+    void clear();                                // message thread, not while recording
+    void ensureChunksAround (double songSec);    // message thread: allocate 60 s ahead
+    // audio thread. songBeat = quarter notes since the recording origin
+    void process (const float* L, const float* R, int n, double songBeat, double beatsPerSample, double bpm) noexcept;
+
+    double rate() const { return dsr; }
+    double bpmUsed() const { return bpm.load(); }
+    int lastBar() const { return maxBar.load(); }                    // -1 = nothing yet
+    bool barHeard (int bar) const { return bar >= 0 && bar < kMaxBars && heard[(size_t) bar] != 0; }
+    void forgetBars (int from, int to);                              // message thread: before re-learning a range
+    int firstAudibleBar() const;
+    const float* overviewMin() const { return ovMin.data(); }
+    const float* overviewMax() const { return ovMax.data(); }
+
+    // copies bars [fromBar, end] into a ReferenceTrack (song-aligned, first bar = fromBar)
+    bool buildTrack (ReferenceTrack& out, int fromBar, float split) const;
+
+    std::atomic<bool> tempoChanged { false };
+
+private:
+    double hostSr = 44100.0, dsr = 16000.0;
+    int D = 3;
+    std::vector<std::unique_ptr<float[]>> storeL, storeR;            // owned by the message thread
+    std::array<std::atomic<float*>, kMaxChunks> chunkL {}, chunkR {};
+    int chunkLen = 0;
+    std::vector<float> ovMin, ovMax;
+    std::vector<uint8_t> heard;
+    std::atomic<int> maxBar { -1 };
+    std::atomic<double> bpm { 0.0 };
+    std::atomic<long long> lastIdx { -1 };
+    Biquad aL1, aL2, aR1, aR2;                                        // anti-alias before decimating
+    long long prevIdx = -1;
+};
+
 } // namespace gs

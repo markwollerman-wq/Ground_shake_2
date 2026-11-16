@@ -259,8 +259,8 @@ void FeetView::paint (juce::Graphics& g)
     auto r = getLocalBounds().toFloat();
     ledPanel (g, r, 12.0f);
 
-    const auto live = proc.getLiveProfile();
-    const auto& ref = proc.getReferenceProfile();
+    const auto live = proc.getDisplayYouProfile();
+    const auto& ref = proc.getDisplayRefProfile();
     const bool haveYou = live.valid, haveRef = proc.hasReference() && ref.valid;
     const float diff = haveYou && haveRef ? live.shakeDb() - ref.shakeDb() : 0.0f;
     const float tol = proc.getTolerance();
@@ -336,8 +336,8 @@ void StepGridView::paint (juce::Graphics& g)
     g.drawText ("sub on every 16th, averaged over the loop   |   dim = gap / dropout   |   ^ / v = 3 dB+ above / below ref",
                 title, juce::Justification::centredRight);
 
-    const auto live = proc.getLiveProfile();
-    const auto& ref = proc.getReferenceProfile();
+    const auto live = proc.getDisplayYouProfile();
+    const auto& ref = proc.getDisplayRefProfile();
     const bool haveYou = live.valid, haveRef = proc.hasReference() && ref.valid;
     const auto& snap = proc.getSnapshotProfile();
 
@@ -439,155 +439,378 @@ void StepGridView::paint (juce::Graphics& g)
 }
 
 //==============================================================================
-//  Reference waveform + 8-bar window
+//  Arrangement: the reference on top, your learned track below, pairs in colour
 //==============================================================================
-juce::Rectangle<float> ReferenceView::waveArea() const
+juce::Colour ArrangementView::pairColour (int index)
 {
-    return getLocalBounds().toFloat().reduced (16.0f, 0.0f).withTrimmedTop (34.0f).withTrimmedBottom (10.0f);
+    static const juce::uint32 c[] = { 0xff3fd0ff, 0xffffb13f, 0xffb48cff, 0xff35e07a, 0xffff6fb5, 0xff2fe0c8, 0xffc6f04a, 0xffff7a3d };
+    return juce::Colour (c[((index % 8) + 8) % 8]);
 }
 
-float ReferenceView::xForTime (double sec) const
+float ArrangementView::xForTime (double sec) const
 {
     auto* ref = proc.getReference();
-    auto a = waveArea();
+    auto a = refLane();
     if (ref == nullptr) return a.getX();
     return a.getX() + (float) (sec / ref->lengthSeconds()) * a.getWidth();
 }
 
-double ReferenceView::timeForX (float x) const
+double ArrangementView::timeForX (float x) const
 {
     auto* ref = proc.getReference();
-    auto a = waveArea();
+    auto a = refLane();
     if (ref == nullptr) return 0.0;
     return (x - a.getX()) / a.getWidth() * ref->lengthSeconds();
 }
 
-void ReferenceView::paint (juce::Graphics& g)
+int ArrangementView::songBarsShown() const
 {
-    auto a = waveArea();                 // the panel itself is drawn by the parent (it wraps the controls too)
+    int n = juce::jmax (16, proc.getLearnedBars());
+    for (auto& p : proc.getPairs()) n = juce::jmax (n, p.songEnd);
+    return n;
+}
+
+float ArrangementView::xForBar (double bar) const
+{
+    auto a = songLane();
+    return a.getX() + (float) (bar / songBarsShown()) * a.getWidth();
+}
+
+double ArrangementView::barForX (float x) const
+{
+    auto a = songLane();
+    return (x - a.getX()) / a.getWidth() * songBarsShown();
+}
+
+int ArrangementView::pairAt (float x, int& edge) const
+{
+    const auto& ps = proc.getPairs();
+    for (int i = 0; i < (int) ps.size(); ++i)
+    {
+        const float x0 = xForBar (ps[(size_t) i].songStart), x1 = xForBar (ps[(size_t) i].songEnd);
+        if (std::abs (x - x0) <= 5.0f) { edge = -1; return i; }
+        if (std::abs (x - x1) <= 5.0f) { edge = 1; return i; }
+        if (x > x0 && x < x1) { edge = 0; return i; }
+    }
+    edge = 0;
+    return -1;
+}
+
+bool ArrangementView::getDraft (int& a, int& b) const
+{
+    if (draftA < 0 || draftB <= draftA) return false;
+    a = draftA;  b = draftB;
+    return true;
+}
+
+void ArrangementView::paint (juce::Graphics& g)
+{
+    // ---- title row
+    auto head = getLocalBounds().toFloat().reduced (16.0f, 0.0f).withHeight (28.0f);
+    g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+    g.setColour (muted);
+    g.drawText ("REFERENCE", head, juce::Justification::centredLeft);
+    auto* ref = proc.getReference();
+    g.setColour (text);
+    g.setFont (juce::FontOptions (13.0f));
+    g.drawText (ref != nullptr ? ref->name : juce::String ("--"), head.withTrimmedLeft (160.0f).withWidth (210.0f),
+                juce::Justification::centredLeft, true);
+    g.setColour (muted);
+    g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+    g.drawText ("BARS", juce::Rectangle<float> (378.0f, head.getY(), 40.0f, head.getHeight()), juce::Justification::centredRight);
+
+    // ---- reference lane
+    auto a = refLane();
     g.setColour (juce::Colour (0xff0d0d11));
     g.fillRoundedRectangle (a, 6.0f);
-
-    auto* ref = proc.getReference();
+    const int sel = proc.getSelectedPair();
+    const auto& pairs = proc.getPairs();
+    float selWx0 = -1, selWx1 = -1;
     if (ref == nullptr || proc.isLoading())
     {
         g.setColour (muted);
         g.setFont (juce::FontOptions (14.0f));
         g.drawText (proc.isLoading() ? "Analyzing reference..." : "Drop a WAV, AIFF or MP3 here, or press LOAD",
                     a, juce::Justification::centred);
-        return;
     }
-
-    const double bpm = proc.getBpm(), barSec = 240.0 / bpm;
-    const int barsAvail = proc.getNumReferenceBars();
-    const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, barsAvail));
-    const double winStart = proc.getGridStartSec() + proc.getWindowStartBar() * barSec;
-    const double winEnd = winStart + bars * barSec;
-    const float wx0 = xForTime (winStart), wx1 = xForTime (winEnd);
-
-    // waveform
-    const auto n = ref->overviewMin.size();
-    float peak = 1.0e-6f;
-    for (size_t i = 0; i < n; ++i) peak = std::max ({ peak, ref->overviewMax[i], -ref->overviewMin[i] });
-    const float mid = a.getCentreY(), half = a.getHeight() * 0.44f / peak;
-    for (size_t i = 0; i < n; ++i)
-    {
-        const float x = a.getX() + a.getWidth() * (float) i / (float) n;
-        const bool inside = x >= wx0 && x <= wx1;
-        g.setColour (inside ? red.withAlpha (0.9f) : redDim.withAlpha (0.8f));
-        g.drawVerticalLine ((int) x, mid - ref->overviewMax[i] * half, mid - ref->overviewMin[i] * half + 1.0f);
-    }
-
-    // bar lines (every 4 bars brighter)
-    for (int b = 0;; ++b)
-    {
-        const double t = proc.getGridStartSec() + b * barSec;
-        if (t > ref->lengthSeconds()) break;
-        if (t < 0) continue;
-        g.setColour (juce::Colours::white.withAlpha (b % 4 == 0 ? 0.18f : 0.06f));
-        g.drawVerticalLine ((int) xForTime (t), a.getY(), a.getBottom());
-    }
-
-    // the 8-bar window
-    auto win = juce::Rectangle<float> (wx0, a.getY(), wx1 - wx0, a.getHeight());
-    g.setColour (red.withAlpha (0.10f));
-    g.fillRoundedRectangle (win, 4.0f);
-    for (auto [w, al] : { std::pair { 6.0f, 0.10f }, { 3.0f, 0.25f } })
-    {
-        g.setColour (red.withAlpha (al));
-        g.drawRoundedRectangle (win, 4.0f, w);
-    }
-    g.setColour (red);
-    g.drawRoundedRectangle (win, 4.0f, 1.4f);
-
-    // playhead while listening to B
-    const double ph = proc.getRefPlayPositionSec();
-    if (ph >= 0)
-    {
-        g.setColour (juce::Colours::white.withAlpha (0.85f));
-        g.drawVerticalLine ((int) xForTime (ph), a.getY(), a.getBottom());
-    }
-
-    // header text
-    auto head = getLocalBounds().toFloat().reduced (16.0f, 0.0f).withHeight (32.0f);
-    g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
-    g.setColour (muted);
-    g.drawText ("REFERENCE", head, juce::Justification::centredLeft);
-    g.setColour (text);
-    g.setFont (juce::FontOptions (13.0f));
-    g.drawText (ref->name, head.withTrimmedLeft (90.0f).withWidth (260.0f), juce::Justification::centredLeft, true);
-    g.setColour (muted);
-    g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
-    g.drawText ("BARS", juce::Rectangle<float> (378.0f, head.getY(), 40.0f, head.getHeight()), juce::Justification::centredRight);
-    g.setColour (red);
-    g.setFont (juce::FontOptions (12.5f, juce::Font::bold));
-    const int first = proc.getWindowStartBar() + 1;
-    const juce::String tag = proc.isBreakdownMode() ? "BREAKDOWN  "
-                           : (proc.getWindowStartBar() == proc.getDropBar() ? "DROP  " : juce::String());
-    g.drawText (tag + "bars " + juce::String (first) + "-" + juce::String (first + bars - 1) + " of " + juce::String (barsAvail)
-                    + "  |  drag to move",
-                head, juce::Justification::centredRight);
-
-    // where the drop and the breakdown are
-    auto marker = [&] (int bar, const juce::String& label, juce::Colour c)
-    {
-        if (bar < 0 || barsAvail <= gs::kBars) return;      // a short clip has no sections to mark
-        const float x = xForTime (proc.getGridStartSec() + bar * barSec);
-        g.setColour (c.withAlpha (0.8f));
-        g.fillRect (x - 1.0f, a.getY(), 2.0f, 8.0f);
-        g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
-        g.drawText (label, juce::Rectangle<float> (x + 3.0f, a.getY() + 1.0f, 80.0f, 11.0f), juce::Justification::centredLeft);
-    };
-    marker (proc.getDropBar(), "DROP", yellow);
-    marker (proc.getBreakdownBar(), "BREAKDOWN", blue);
-}
-
-void ReferenceView::mouseDown (const juce::MouseEvent& e)
-{
-    if (proc.getReference() == nullptr) return;
-    const double barSec = 240.0 / proc.getBpm();
-    const int barUnder = (int) std::floor ((timeForX ((float) e.x) - proc.getGridStartSec()) / barSec);
-    const int start = proc.getWindowStartBar();
-    const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, proc.getNumReferenceBars()));
-    if (barUnder >= start && barUnder < start + bars)
-        dragGrabBarOffset = barUnder - start;
     else
     {
-        dragGrabBarOffset = bars / 2;
-        proc.setWindowStartBar (barUnder - dragGrabBarOffset);
+        const double bpm = proc.getBpm(), barSec = 240.0 / bpm;
+        const int barsAvail = proc.getNumReferenceBars();
+        const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, barsAvail));
+        const double winStart = proc.getGridStartSec() + proc.getWindowStartBar() * barSec;
+        const float wx0 = xForTime (winStart), wx1 = xForTime (winStart + bars * barSec);
+        selWx0 = wx0;  selWx1 = wx1;
+
+        const auto n = ref->overviewMin.size();
+        float peak = 1.0e-6f;
+        for (size_t i = 0; i < n; ++i) peak = std::max ({ peak, ref->overviewMax[i], -ref->overviewMin[i] });
+        const float mid = a.getCentreY(), half = a.getHeight() * 0.44f / peak;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const float x = a.getX() + a.getWidth() * (float) i / (float) n;
+            g.setColour (x >= wx0 && x <= wx1 ? red.withAlpha (0.9f) : redDim.withAlpha (0.8f));
+            g.drawVerticalLine ((int) x, mid - ref->overviewMax[i] * half, mid - ref->overviewMin[i] * half + 1.0f);
+        }
+        for (int b = 0;; ++b)
+        {
+            const double t = proc.getGridStartSec() + b * barSec;
+            if (t > ref->lengthSeconds()) break;
+            if (t < 0) continue;
+            g.setColour (juce::Colours::white.withAlpha (b % 4 == 0 ? 0.16f : 0.05f));
+            g.drawVerticalLine ((int) xForTime (t), a.getY(), a.getBottom());
+        }
+        // where each pair (on this reference) points
+        for (int i = 0; i < (int) pairs.size(); ++i)
+        {
+            const auto& p = pairs[(size_t) i];
+            if (p.slot != proc.getActiveSlot()) continue;
+            const double t0 = proc.getGridStartSec() + p.refStart * barSec;
+            auto band = juce::Rectangle<float> (xForTime (t0), a.getBottom() - 5.0f, xForTime (t0 + p.refBars * barSec) - xForTime (t0), 4.0f);
+            g.setColour (pairColour (p.colour).withAlpha (i == sel ? 1.0f : 0.6f));
+            g.fillRect (band);
+        }
+        auto win = juce::Rectangle<float> (wx0, a.getY(), wx1 - wx0, a.getHeight());
+        g.setColour (red.withAlpha (0.10f));
+        g.fillRoundedRectangle (win, 4.0f);
+        g.setColour (red.withAlpha (0.25f));
+        g.drawRoundedRectangle (win, 4.0f, 3.0f);
+        g.setColour (sel >= 0 && sel < (int) pairs.size() ? pairColour (pairs[(size_t) sel].colour) : red);
+        g.drawRoundedRectangle (win, 4.0f, 1.4f);
+        const double ph = proc.getRefPlayPositionSec();
+        if (ph >= 0)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.85f));
+            g.drawVerticalLine ((int) xForTime (ph), a.getY(), a.getBottom());
+        }
+        auto marker = [&] (int bar, const juce::String& label, juce::Colour c)
+        {
+            if (bar < 0 || barsAvail <= gs::kBars) return;
+            const float x = xForTime (proc.getGridStartSec() + bar * barSec);
+            g.setColour (c.withAlpha (0.8f));
+            g.fillRect (x - 1.0f, a.getY(), 2.0f, 8.0f);
+            g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+            g.drawText (label, juce::Rectangle<float> (x + 3.0f, a.getY() + 1.0f, 80.0f, 11.0f), juce::Justification::centredLeft);
+        };
+        marker (proc.getDropBar(), "DROP", yellow);
+        marker (proc.getBreakdownBar(), "BREAKDOWN", blue);
+
+        g.setColour (red);
+        g.setFont (juce::FontOptions (12.5f, juce::Font::bold));
+        const int first = proc.getWindowStartBar() + 1;
+        const juce::String tag = sel >= 0 ? "PAIR " + juce::String (sel + 1) + "  "
+                               : proc.isBreakdownMode() ? "BREAKDOWN  "
+                               : (proc.getWindowStartBar() == proc.getDropBar() ? "DROP  " : juce::String());
+        g.drawText (tag + "bars " + juce::String (first) + "-" + juce::String (first + bars - 1) + " of " + juce::String (barsAvail)
+                        + "  |  drag to move",
+                    head, juce::Justification::centredRight);
+    }
+
+    // ---- your learned track
+    auto s = songLane();
+    g.setColour (juce::Colour (0xff0d0d11));
+    g.fillRoundedRectangle (s, 6.0f);
+    const auto& ovMn = proc.getLearnedOverviewMin();
+    const auto& ovMx = proc.getLearnedOverviewMax();
+    const int per = gs::SongRecorder::kOverviewPerBar, trim = proc.getTrimBars();
+    const int shown = songBarsShown();
+    const int startBar = proc.getEffectiveStartBar();
+    if (proc.getLearnedBars() <= 0 && ovMn.empty())
+    {
+        g.setColour (muted);
+        g.setFont (juce::FontOptions (13.0f));
+        g.drawText ("YOUR TRACK: press LEARN, then play your song in Ableton from bar " + juce::String (startBar > 0 ? startBar : 1)
+                        + " to the end", s, juce::Justification::centred);
+    }
+    else
+    {
+        float peak = 1.0e-6f;
+        for (size_t i = (size_t) trim * per; i < ovMn.size(); ++i) peak = std::max ({ peak, ovMx[i], -ovMn[i] });
+        const float mid = s.getCentreY(), half = s.getHeight() * 0.42f / peak;
+        const int total = juce::jmin ((int) ovMn.size() / per - trim, shown);
+        for (int b = 0; b < total; ++b)
+            for (int q = 0; q < per; ++q)
+            {
+                const size_t idx = (size_t) (b + trim) * per + q;
+                const float x0 = xForBar (b + q / (double) per), x1 = xForBar (b + (q + 1) / (double) per);
+                g.setColour (juce::Colour (0xffd8d8de).withAlpha (0.55f));
+                g.fillRect (juce::Rectangle<float>::leftTopRightBottom (x0, mid - ovMx[idx] * half, juce::jmax (x0 + 0.8f, x1),
+                                                                         mid - ovMn[idx] * half + 1.0f));
+            }
+    }
+    // bar lines + Ableton bar numbers
+    g.setFont (juce::FontOptions (9.5f));
+    for (int b = 0; b <= shown; b += 4)
+    {
+        const float x = xForBar (b);
+        g.setColour (juce::Colours::white.withAlpha (b % 16 == 0 ? 0.16f : 0.06f));
+        g.drawVerticalLine ((int) x, s.getY(), s.getBottom());
+        if (b % 16 == 0 && b < shown)
+        {
+            g.setColour (muted.withAlpha (0.9f));
+            g.drawText (juce::String (startBar + b), juce::Rectangle<float> (x + 2.0f, s.getBottom() - 12.0f, 40.0f, 11.0f),
+                        juce::Justification::centredLeft);
+        }
+    }
+    // pairs
+    for (int i = 0; i < (int) pairs.size(); ++i)
+    {
+        const auto& p = pairs[(size_t) i];
+        int a0 = p.songStart, a1 = p.songEnd;
+        if ((drag == Drag::resizeStart || drag == Drag::resizeEnd) && dragPair == i) { a0 = tempA; a1 = tempB; }
+        auto block = juce::Rectangle<float>::leftTopRightBottom (xForBar (a0), s.getY() + 1.0f, xForBar (a1), s.getBottom() - 1.0f);
+        const auto c = pairColour (p.colour);
+        g.setColour (c.withAlpha (i == sel ? 0.28f : 0.14f));
+        g.fillRoundedRectangle (block, 4.0f);
+        g.setColour (c.withAlpha (i == sel ? 1.0f : 0.7f));
+        g.drawRoundedRectangle (block, 4.0f, i == sel ? 2.0f : 1.0f);
+        auto tag = juce::Rectangle<float> (block.getX() + 4.0f, block.getY() + 3.0f, 32.0f, 14.0f);
+        g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+        g.drawText (juce::String (i + 1) + (p.slot == 1 ? "B" : ""), tag.withTrimmedLeft (12.0f), juce::Justification::centredLeft);
+        const auto light = p.status == 1 ? green : p.status == 2 ? yellow : p.status == 3 ? over : grey;
+        g.setColour (light.withAlpha (0.3f));
+        g.fillEllipse (juce::Rectangle<float> (12.0f, 12.0f).withCentre ({ tag.getX() + 5.0f, tag.getCentreY() }));
+        g.setColour (light);
+        g.fillEllipse (juce::Rectangle<float> (8.0f, 8.0f).withCentre ({ tag.getX() + 5.0f, tag.getCentreY() }));
+        if (p.needsLearn)
+        {
+            g.setColour (yellow);
+            g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
+            g.drawText ("RE-LEARN", block.reduced (4.0f, 2.0f), juce::Justification::bottomLeft);
+        }
+    }
+    // the stretch you're dragging out
+    if (draftA >= 0 && draftB > draftA)
+    {
+        auto d = juce::Rectangle<float>::leftTopRightBottom (xForBar (draftA), s.getY(), xForBar (draftB), s.getBottom());
+        g.setColour (juce::Colours::white.withAlpha (0.12f));
+        g.fillRoundedRectangle (d, 4.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.8f));
+        g.drawRoundedRectangle (d, 4.0f, 1.2f);
+        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+        g.drawText ("bars " + juce::String (startBar + draftA) + "-" + juce::String (startBar + draftB - 1) + "  (+ PAIR)",
+                    d.reduced (4.0f, 2.0f).withHeight (14.0f), juce::Justification::centredLeft, false);
+    }
+    // the playhead, and the learn pass
+    const double nowBar = proc.getSongBarNow();
+    if (proc.isHostPlaying() && nowBar >= 0 && nowBar < shown)
+    {
+        g.setColour (juce::Colours::white.withAlpha (0.85f));
+        g.drawVerticalLine ((int) xForBar (nowBar), s.getY(), s.getBottom());
+    }
+    g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+    g.setColour (muted);
+    g.drawText ("YOUR TRACK", s.reduced (6.0f, 2.0f).withHeight (13.0f), juce::Justification::topRight);
+    if (proc.getLearnState() != GroundShakeProcessor::LearnState::off)
+    {
+        g.setColour (red);
+        g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+        g.drawText ("LEARNING  bar " + juce::String (startBar + (int) juce::jmax (0.0, nowBar)), s.reduced (8.0f, 4.0f).withTrimmedTop (12.0f),
+                    juce::Justification::topRight);
+    }
+    // connect the selected pair to where it points in the reference
+    if (sel >= 0 && sel < (int) pairs.size() && selWx0 >= 0 && pairs[(size_t) sel].slot == proc.getActiveSlot())
+    {
+        const auto& p = pairs[(size_t) sel];
+        const float xa = (selWx0 + selWx1) * 0.5f, xb = (xForBar (p.songStart) + xForBar (p.songEnd)) * 0.5f;
+        juce::Path link;
+        link.startNewSubPath (xa, a.getBottom());
+        link.cubicTo (xa, a.getBottom() + 5.0f, xb, s.getY() - 5.0f, xb, s.getY());
+        g.setColour (pairColour (p.colour).withAlpha (0.85f));
+        g.strokePath (link, juce::PathStrokeType (1.6f));
     }
 }
 
-void ReferenceView::mouseDrag (const juce::MouseEvent& e)
+void ArrangementView::mouseMove (const juce::MouseEvent& e)
 {
-    if (proc.getReference() == nullptr) return;
-    const double barSec = 240.0 / proc.getBpm();
-    const int barUnder = (int) std::floor ((timeForX ((float) e.x) - proc.getGridStartSec()) / barSec);
-    const int target = barUnder - dragGrabBarOffset;
-    if (target != proc.getWindowStartBar())
-        proc.setWindowStartBar (target);              // snaps to whole bars
+    int edge = 0;
+    const bool inSong = songLane().contains (e.position);
+    const int i = inSong ? pairAt (e.position.x, edge) : -1;
+    setMouseCursor (i >= 0 && edge != 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
 }
 
+void ArrangementView::mouseDown (const juce::MouseEvent& e)
+{
+    drag = Drag::none;
+    if (refLane().expanded (0.0f, 4.0f).contains (e.position))
+    {
+        if (proc.getReference() == nullptr) return;
+        drag = Drag::refWindow;
+        const double barSec = 240.0 / proc.getBpm();
+        const int barUnder = (int) std::floor ((timeForX (e.position.x) - proc.getGridStartSec()) / barSec);
+        const int start = proc.getWindowStartBar();
+        const int bars = juce::jlimit (1, proc.getWindowBars(), juce::jmax (1, proc.getNumReferenceBars()));
+        if (barUnder >= start && barUnder < start + bars)
+            dragGrabBarOffset = barUnder - start;
+        else
+        {
+            dragGrabBarOffset = bars / 2;
+            proc.setWindowStartBar (barUnder - dragGrabBarOffset);
+        }
+        return;
+    }
+    if (! songLane().contains (e.position)) return;
+    int edge = 0;
+    const int i = pairAt (e.position.x, edge);
+    if (i >= 0 && edge != 0)
+    {
+        drag = edge < 0 ? Drag::resizeStart : Drag::resizeEnd;
+        dragPair = i;
+        tempA = proc.getPairs()[(size_t) i].songStart;
+        tempB = proc.getPairs()[(size_t) i].songEnd;
+        return;
+    }
+    if (i >= 0)
+    {
+        proc.selectPair (i);              // clicking a pair turns FOLLOW off
+        clearDraft();
+        if (onDraftChanged) onDraftChanged();
+        return;
+    }
+    // starting a new stretch: let go of the selected pair, so moving the reference window
+    // next doesn't re-point that pair
+    if (proc.getSelectedPair() >= 0) proc.selectPair (-1);
+    drag = Drag::draft;
+    draftAnchor = juce::jmax (0, (int) std::floor (barForX (e.position.x)));
+    draftA = draftB = -1;
+}
+
+void ArrangementView::mouseDrag (const juce::MouseEvent& e)
+{
+    if (drag == Drag::refWindow)
+    {
+        const double barSec = 240.0 / proc.getBpm();
+        const int barUnder = (int) std::floor ((timeForX (e.position.x) - proc.getGridStartSec()) / barSec);
+        const int target = barUnder - dragGrabBarOffset;
+        if (target != proc.getWindowStartBar()) proc.setWindowStartBar (target);
+        return;
+    }
+    const int bar = juce::jlimit (0, songBarsShown(), (int) std::round (barForX (e.position.x)));
+    if (drag == Drag::draft)
+    {
+        const int cur = juce::jmax (0, (int) std::floor (barForX (e.position.x)));
+        draftA = juce::jmin (draftAnchor, cur);
+        draftB = juce::jmax (draftAnchor, cur) + 1;
+        repaint();
+        if (onDraftChanged) onDraftChanged();
+    }
+    else if (drag == Drag::resizeStart) { tempA = juce::jmin (bar, tempB - 1); repaint(); }
+    else if (drag == Drag::resizeEnd)   { tempB = juce::jmax (bar, tempA + 1); repaint(); }
+}
+
+void ArrangementView::mouseUp (const juce::MouseEvent& e)
+{
+    if ((drag == Drag::resizeStart || drag == Drag::resizeEnd) && dragPair >= 0)
+        proc.setPairRange (dragPair, tempA, tempB);
+    else if (drag == Drag::draft && e.mouseWasClicked())
+    {
+        clearDraft();                      // a plain click clears the stretch
+        if (onDraftChanged) onDraftChanged();
+    }
+    drag = Drag::none;
+    dragPair = -1;
+    repaint();
+}
 
 //==============================================================================
 //  Text helpers
@@ -757,11 +980,11 @@ void DiagnosticsStrip::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat();
     ledPanel (g, r, 12.0f);
-    const auto& coach = proc.getCoach();
-    const auto you = proc.getLiveMeasurements();
-    const auto& ref = proc.getReferenceMeasurements();
-    const auto liveP = proc.getLiveProfile();
-    const auto& refP = proc.getReferenceProfile();
+    const auto& coach = proc.getDisplayCoach();
+    const auto you = proc.getDisplayYouMeasurements();
+    const auto& ref = proc.getDisplayRefMeasurements();
+    const auto liveP = proc.getDisplayYouProfile();
+    const auto& refP = proc.getDisplayRefProfile();
 
     struct Tile { juce::String title, big; juce::Colour colour; juce::String l1, l2; };
     auto rowOf = [&] (gs::CheckId id, juce::String& value, juce::Colour& c)
@@ -785,8 +1008,27 @@ void DiagnosticsStrip::paint (juce::Graphics& g)
         auto& t = tiles[1];
         t.title = "KICK / BASS";
         rowOf (gs::CheckId::kickBass, t.big, t.colour);
-        t.l1 = "1st 16th vs ref";
-        t.l2 = "levels lined up";
+        static const char* lenS[] = { "short", "medium", "long" };
+        static const char* attS[] = { "sharp", "medium", "soft" };
+        auto kickShort = [&] (const gs::Measurements& m)
+        { return m.valid && m.kick.valid ? juce::String (lenS[m.kick.lengthClass()]) + "/" + attS[m.kick.attackClass()] : juce::String ("--"); };
+        auto bassShort = [] (const gs::Measurements& m)
+        {
+            switch (m.bassPattern)
+            {
+                case gs::BassPattern::rolling16: return juce::String ("16ths");
+                case gs::BassPattern::rolling8:  return juce::String ("8ths");
+                case gs::BassPattern::offbeat:   return juce::String ("offbeat");
+                case gs::BassPattern::gallop:    return juce::String ("gallop");
+                case gs::BassPattern::reverse:   return juce::String ("reverse");
+                case gs::BassPattern::sustained: return juce::String ("held");
+                case gs::BassPattern::none:      return juce::String ("none");
+                case gs::BassPattern::unknown:
+                default:                         return juce::String (m.valid ? "mixed" : "--");
+            }
+        };
+        t.l1 = "kick " + kickShort (you) + " / " + kickShort (ref);
+        t.l2 = "bass " + bassShort (you) + " / " + bassShort (ref);
     }
     {
         auto& t = tiles[2];
@@ -861,7 +1103,7 @@ void ChecklistView::paint (juce::Graphics& g)
     auto r = getLocalBounds().toFloat();
     ledPanel (g, r, 12.0f);
     auto inner = r.reduced (16.0f, 10.0f);
-    const auto& coach = proc.getCoach();
+    const auto& coach = proc.getDisplayCoach();
 
     auto head = inner.removeFromTop (20.0f);
     g.setFont (font (13.0f, true));
@@ -871,16 +1113,22 @@ void ChecklistView::paint (juce::Graphics& g)
     g.setColour (pct < 0 ? muted : (pct >= 90 ? green : (pct >= 60 ? yellow : over)));
     g.drawText (pct < 0 ? juce::String ("match: --") : "match: " + juce::String (juce::roundToInt (pct)) + "%", head,
                 juce::Justification::centredRight);
-    if (proc.isBreakdownMode())
+    auto badge = [&] (const juce::String& txt, juce::Colour c, float cx)
     {
-        auto b = juce::Rectangle<float> (head.getCentreX() - 70.0f, head.getY() + 1.0f, 120.0f, 18.0f);
-        g.setColour (blue.withAlpha (0.15f));
+        auto b = juce::Rectangle<float> (cx - 52.0f, head.getY() + 1.0f, 104.0f, 18.0f);
+        g.setColour (c.withAlpha (0.15f));
         g.fillRoundedRectangle (b, 9.0f);
-        g.setColour (blue);
+        g.setColour (c);
         g.drawRoundedRectangle (b, 9.0f, 1.0f);
         g.setFont (font (10.5f, true));
-        g.drawText ("BREAKDOWN MODE", b, juce::Justification::centred);
-    }
+        g.drawText (txt, b, juce::Justification::centred);
+    };
+    const int sel = proc.getSelectedPair();
+    if (sel >= 0)
+        badge ("PAIR " + juce::String (sel + 1) + (proc.isShowingSavedPair() ? " LEARNED" : " LIVE"),
+               ArrangementView::pairColour (proc.getPairs()[(size_t) sel].colour), head.getX() + 142.0f);
+    if (proc.isDisplayBreakdown())
+        badge ("BREAKDOWN", blue, head.getX() + (sel >= 0 ? 252.0f : 142.0f));
 
     auto bar = inner.removeFromTop (12.0f).withSizeKeepingCentre (inner.getWidth(), 6.0f);
     g.setColour (juce::Colour (0xff1a1a20));
@@ -897,10 +1145,11 @@ void ChecklistView::paint (juce::Graphics& g)
     inner.removeFromTop (6.0f);
 
     const auto& rows = coach.checks();
-    const float colW = inner.getWidth() / 2.0f, rowH = inner.getHeight() / 5.0f;
-    for (size_t i = 0; i < rows.size() && i < 10; ++i)
+    const int perCol = (int) (rows.size() + 1) / 2;
+    const float colW = inner.getWidth() / 2.0f, rowH = inner.getHeight() / (float) juce::jmax (1, perCol);
+    for (size_t i = 0; i < rows.size(); ++i)
     {
-        const int col = (int) i / 5, row = (int) i % 5;
+        const int col = (int) i / perCol, row = (int) i % perCol;
         auto cell = juce::Rectangle<float> (inner.getX() + col * colW, inner.getY() + row * rowH, colW, rowH).reduced (2.0f, 1.0f);
         const auto& rw = rows[i];
         statusIcon (g, cell.removeFromLeft (16.0f), rw.status);
@@ -941,7 +1190,7 @@ int FixListView::expandedHighlight() const
 
 void FixListView::refresh (int viewWidth)
 {
-    cards = proc.getCoach().cards();
+    cards = proc.getDisplayCards();
     if (userExpanded >= 0)
     {
         bool found = false;
@@ -990,6 +1239,7 @@ float FixListView::layoutCard (juce::Graphics* g, const gs::FixCard& c, bool exp
     if (c.fixFirst)                         badge ("FIX THIS FIRST", red);
     else if (c.severity == Status::holding) badge ("FIXED - HOLDING FOR ONE LOOP", green);
     else if (c.severity == Status::info)    badge ("INFORMATION", grey);
+    if (c.adviceOnly && c.severity != Status::holding) badge ("SOUND / NOTE CHOICE: YOU CHANGE THIS", yellow);
 
     {
         auto tl = layoutText (attr (c.title, font (13.0f, true), text), w - 18.0f);
@@ -1016,17 +1266,19 @@ float FixListView::layoutCard (juce::Graphics* g, const gs::FixCard& c, bool exp
         y += para (g, "", c.see, x, y, w, muted.brighter (0.25f), 11.5f);
         if (c.progress.isNotEmpty()) y += 4.0f + para (g, "Progress:", c.progress, x, y + 4.0f, w, text, 11.5f);
         if (c.worse.isNotEmpty()) y += 4.0f + para (g, "Careful:", c.worse, x, y + 4.0f, w, over.brighter (0.3f), 11.5f);
+        if (c.fixed.isNotEmpty()) y += 4.0f + para (g, "Fixed:", c.fixed, x, y + 4.0f, w, blue.brighter (0.4f), 11.5f);
         return y + 10.0f - area.getY();
     }
 
     const float gap = 6.0f;
     y += para (g, "Comparing to:", c.comparing, x, y, w, text) + gap;
+    if (c.fixed.isNotEmpty()) y += para (g, "Ground Shake:", c.fixed, x, y, w, blue.brighter (0.4f)) + gap;
     y += para (g, "What we see:", c.see, x, y, w, text) + gap;
     if (c.beatGraph)
     {
         if (g != nullptr)
         {
-            const auto bs = gs::beatShape (proc.getLiveProfile(), proc.getReferenceProfile());
+            const auto bs = gs::beatShape (proc.getDisplayYouProfile(), proc.getDisplayRefProfile());
             drawBeatGraph (*g, { x, y, w, 104.0f }, bs, c.beatMask, c.severity == Status::holding ? green : yellow);
         }
         y += 104.0f + gap + 2.0f;
@@ -1035,7 +1287,7 @@ float FixListView::layoutCard (juce::Graphics* g, const gs::FixCard& c, bool exp
     if (! c.how.isEmpty())
     {
         const bool kick = c.id == gs::CheckId::beatShape || c.id == gs::CheckId::kickBass;
-        y += para (g, kick ? "How (Kickstart 2):" : "How:", " ", x, y, w, text);
+        y += para (g, kick ? "Do it yourself (Kickstart 2):" : "Do it yourself:", " ", x, y, w, text);
         for (int i = 0; i < c.how.size(); ++i)
         {
             const float h = para (g, juce::String (i + 1) + ".", c.how[i], x + 10.0f, y + 2.0f, w - 10.0f, text);
@@ -1127,11 +1379,14 @@ void FixListView::mouseUp (const juce::MouseEvent& e)
 //  Main content (laid out at 1400 x 820, scaled as a whole when resized)
 //==============================================================================
 GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
-    : proc (p), feet (p), grid (p), refView (p), strip (p), checklist (p), fixList (p)
+    : proc (p), feet (p), grid (p), arrangement (p), strip (p), checklist (p), fixList (p)
 {
     setLookAndFeel (&lnf);
     for (auto* c : std::initializer_list<juce::Component*> {
-             &feet, &grid, &refView, &strip, &checklist, &fixViewport, &aButton, &bButton, &loadButton, &x2Button,
+             &slotA, &slotB, &learnButton, &learnPairButton, &addPairButton, &deletePairButton, &autoPairButton,
+             &matchAllButton, &followButton, &startDown, &startUp, &feelKnob, &punchKnob, &attackKnob, &tailKnob,
+             &mudKnob, &lowCutKnob, &duckKnobs[0], &duckKnobs[1], &duckKnobs[2], &duckKnobs[3], &monoButton,
+             &feet, &grid, &arrangement, &strip, &checklist, &fixViewport, &aButton, &bButton, &loadButton, &x2Button,
              &halfButton, &nudgeLeft, &nudgeRight, &dropButton, &breakdownButton, &bars1, &bars2, &bars4, &bars8,
              &loopButton, &bpmLabel, &bpmTitle, &detectedLabel, &offsetLabel,
              &rangeKnob, &toleranceKnob, &autoButton, &snapshotButton, &resetButton, &reanalyzeButton, &dj6, &dj9, &dj12,
@@ -1247,10 +1502,109 @@ GroundShakeContent::GroundShakeContent (GroundShakeProcessor& p)
     weightButton.onClick = [this] { proc.setMatchWeight (weightButton.getToggleState()); refreshMatchControls(); };
     weightButton.setTooltip ("Gentle sub saturation: adds harmonics so the sub reads on smaller systems");
 
+    // ---- Phase 3: reference slots
+    for (auto* b : { &slotA, &slotB })
+    {
+        b->setClickingTogglesState (true);
+        b->setRadioGroupId (4);
+    }
+    slotA.onClick = [this] { if (slotA.getToggleState()) proc.setActiveSlot (0); };
+    slotB.onClick = [this] { if (slotB.getToggleState()) proc.setActiveSlot (1); };
+    slotA.setTooltip ("Reference A. With a pair selected, switching moves that pair to this reference.");
+    slotB.setTooltip ("Reference B: load a second reference for sections the first one doesn't have.");
+
+    // ---- learn pass and pairs
+    learnButton.onClick = [this]
+    {
+        if (proc.getLearnState() == GroundShakeProcessor::LearnState::off) proc.startLearn();
+        else proc.stopLearn();
+    };
+    learnButton.setTooltip ("Press, then play your song in Ableton from the song start bar to the end. Press again to finish.");
+    learnPairButton.onClick = [this] { proc.startLearnPair (proc.getSelectedPair()); };
+    learnPairButton.setTooltip ("Re-learn just the selected pair after a mix change: press, then play that section.");
+    addPairButton.onClick = [this]
+    {
+        int a = 0, b = 0;
+        if (arrangement.getDraft (a, b)) { proc.addPair (a, b); arrangement.clearDraft(); }
+    };
+    addPairButton.setTooltip ("Pair the stretch you dragged on your track with the reference window above.");
+    deletePairButton.onClick = [this] { proc.deletePair (proc.getSelectedPair()); };
+    autoPairButton.onClick = [this] { proc.autoPair(); };
+    autoPairButton.setTooltip ("First guess: pair your drops with the reference's drop and your breakdowns with its breakdown.");
+    matchAllButton.onClick = [this] { proc.matchAllPairs(); refreshMatchControls(); };
+    matchAllButton.setTooltip ("Work out and apply the correction for every pair.");
+    followButton.setClickingTogglesState (true);
+    followButton.onClick = [this] { proc.setFollowPlayhead (followButton.getToggleState()); };
+    followButton.setTooltip ("The readout follows the pair that's playing. Clicking a pair turns this off.");
+    startDown.onClick = [this] { proc.setSongStartBar (proc.getSongStartBar() - 1); };
+    startUp.onClick = [this] { proc.setSongStartBar (proc.getSongStartBar() + 1); };
+    startDown.setTooltip ("The Ableton bar your song starts on (below 1 = AUTO: the first bar with sound). Remembered for every project.");
+    arrangement.onDraftChanged = [this] { refreshMatchControls(); };
+
+    // ---- correction knobs
+    auto setupKnob = [] (juce::Slider& k, double lo, double hi, double step, double def)
+    {
+        k.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        k.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        k.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f, juce::MathConstants<float>::pi * 2.75f, true);
+        k.setRange (lo, hi, step);
+        k.setDoubleClickReturnValue (true, def);
+    };
+    setupKnob (feelKnob, -6.0, 6.0, 0.1, 0.0);
+    setupKnob (punchKnob, -6.0, 6.0, 0.1, 0.0);
+    setupKnob (attackKnob, -6.0, 6.0, 0.5, 0.0);
+    setupKnob (tailKnob, -12.0, 6.0, 0.5, 0.0);
+    setupKnob (mudKnob, -9.0, 0.0, 0.5, 0.0);
+    setupKnob (lowCutKnob, 0.0, 250.0, 5.0, 0.0);
+    for (auto& d : duckKnobs) setupKnob (d, -12.0, 3.0, 0.5, 0.0);
+    for (auto* k : { &feelKnob, &punchKnob, &attackKnob, &tailKnob, &mudKnob, &lowCutKnob, &duckKnobs[0], &duckKnobs[1],
+                     &duckKnobs[2], &duckKnobs[3] })
+        k->onValueChange = [this] { applyKnobs(); };
+    monoButton.setClickingTogglesState (true);
+    monoButton.onClick = [this]
+    {
+        auto c = proc.getEditedCorrection();
+        c.mono = monoButton.getToggleState();
+        proc.setEditedCorrection (c);
+        refreshMatchControls();
+    };
+    monoButton.setTooltip ("Sub mono below 120 Hz");
+
     fixList.onLayoutChanged = [this] { fixList.repaint(); };
     proc.onReferenceChanged = [this] { refreshReferenceControls(); };
     refreshReferenceControls();
     refreshMatchControls();
+    refreshKnobs();
+}
+
+void GroundShakeContent::applyKnobs()
+{
+    auto c = proc.getEditedCorrection();
+    c.feelDb = (float) feelKnob.getValue();
+    c.punchDb = (float) punchKnob.getValue();
+    c.attackDb = (float) attackKnob.getValue();
+    c.tailDb = (float) tailKnob.getValue();
+    if (std::abs (c.tailDb) > 0.01f && c.tailStartMs <= 0) c.tailStartMs = 150.0f;
+    c.mudDb = (float) mudKnob.getValue();
+    c.lowCutHz = lowCutKnob.getValue() < 20.0 ? 0.0f : (float) lowCutKnob.getValue();
+    for (size_t k = 0; k < 4; ++k) c.duckDb[k] = (float) duckKnobs[k].getValue();
+    proc.setEditedCorrection (c);
+    repaint (matchR.toNearestInt());
+}
+
+void GroundShakeContent::refreshKnobs()
+{
+    for (auto* k : { &feelKnob, &punchKnob, &attackKnob, &tailKnob, &mudKnob, &lowCutKnob, &duckKnobs[0], &duckKnobs[1],
+                     &duckKnobs[2], &duckKnobs[3] })
+        if (k->isMouseButtonDown()) return;
+    const auto& c = proc.getEditedCorrection();
+    feelKnob.setValue (c.feelDb, juce::dontSendNotification);
+    punchKnob.setValue (c.punchDb, juce::dontSendNotification);
+    attackKnob.setValue (c.attackDb, juce::dontSendNotification);
+    tailKnob.setValue (c.tailDb, juce::dontSendNotification);
+    mudKnob.setValue (c.mudDb, juce::dontSendNotification);
+    lowCutKnob.setValue (c.lowCutHz, juce::dontSendNotification);
+    for (size_t k = 0; k < 4; ++k) duckKnobs[k].setValue (c.duckDb[k], juce::dontSendNotification);
 }
 
 GroundShakeContent::~GroundShakeContent()
@@ -1277,6 +1631,9 @@ void GroundShakeContent::refreshReferenceControls()
     bars4.setToggleState (wb == 4, juce::dontSendNotification);
     bars8.setToggleState (wb == 8, juce::dontSendNotification);
     loopButton.setToggleState (proc.isFollowingLoop(), juce::dontSendNotification);
+    slotA.setToggleState (proc.getActiveSlot() == 0, juce::dontSendNotification);
+    slotB.setToggleState (proc.getActiveSlot() == 1, juce::dontSendNotification);
+    followButton.setToggleState (proc.isFollowingPlayhead(), juce::dontSendNotification);
     bpmLabel.setEditable (has);
     if (! rangeKnob.isMouseButtonDown())
         rangeKnob.setValue (proc.getSplit(), juce::dontSendNotification);
@@ -1285,13 +1642,35 @@ void GroundShakeContent::refreshReferenceControls()
 
 void GroundShakeContent::refreshMatchControls()
 {
-    const auto st = proc.getMatchState();
-    matchButton.setEnabled (proc.hasReference() && proc.liveHasData());
-    previewButton.setEnabled (st == MatchState::ready || st == MatchState::preview);
+    const auto st = proc.getEditedMatchState();
+    const int sel = proc.getSelectedPair();
+    const bool pairMode = ! proc.getPairs().empty();
+    const bool editable = ! pairMode || sel >= 0;
+    const bool selAnalyzed = sel >= 0 && proc.getPairs()[(size_t) sel].analyzed;
+    matchButton.setEnabled (sel >= 0 ? selAnalyzed : (! pairMode && proc.hasReference() && proc.liveHasData()));
+    previewButton.setEnabled (editable && (st == MatchState::ready || st == MatchState::preview));
     previewButton.setToggleState (st == MatchState::preview, juce::dontSendNotification);
-    applyButton.setEnabled (st == MatchState::ready || st == MatchState::preview);
-    revertButton.setEnabled (st != MatchState::off);
-    weightButton.setToggleState (proc.getMatchSettings().weight > 0.0f, juce::dontSendNotification);
+    applyButton.setEnabled (editable && (st == MatchState::ready || st == MatchState::preview));
+    revertButton.setEnabled (editable && st != MatchState::off);
+    weightButton.setEnabled (editable);
+    monoButton.setEnabled (editable);
+    weightButton.setToggleState (proc.getEditedCorrection().weight > 0.0f, juce::dontSendNotification);
+    monoButton.setToggleState (proc.getEditedCorrection().mono, juce::dontSendNotification);
+    for (auto* k : { &feelKnob, &punchKnob, &attackKnob, &tailKnob, &mudKnob, &lowCutKnob, &duckKnobs[0], &duckKnobs[1],
+                     &duckKnobs[2], &duckKnobs[3] })
+        k->setEnabled (editable);
+
+    // learn + pair buttons
+    const bool learningNow = proc.getLearnState() != GroundShakeProcessor::LearnState::off;
+    learnButton.setButtonText (learningNow ? "STOP" : "LEARN");
+    learnButton.setToggleState (learningNow, juce::dontSendNotification);
+    learnPairButton.setEnabled (! learningNow && sel >= 0);
+    int a = 0, b = 0;
+    addPairButton.setEnabled (! learningNow && arrangement.getDraft (a, b) && proc.hasReference() && proc.getLearnedBars() > 0);
+    deletePairButton.setEnabled (! learningNow && sel >= 0);
+    autoPairButton.setEnabled (! learningNow && proc.hasLearnedTrack() && proc.hasReference());
+    matchAllButton.setEnabled (! learningNow && pairMode);
+    followButton.setToggleState (proc.isFollowingPlayhead(), juce::dontSendNotification);
     repaint (matchR.toNearestInt());
 }
 
@@ -1323,7 +1702,13 @@ juce::String GroundShakeContent::statusText() const
 {
     if (proc.isLoading()) return "Analyzing the reference: tempo, downbeat, drop and sub...";
     if (proc.getLoadError().isNotEmpty()) return proc.getLoadError();
-    return proc.getCoach().statusLine();
+    const auto msg = proc.getLearnMessage();
+    if (msg.isNotEmpty() && (proc.getLearnState() != GroundShakeProcessor::LearnState::off
+                             || juce::Time::getMillisecondCounterHiRes() / 1000.0 - learnMessageTime < 8.0))
+        return msg;
+    const int sel = proc.getSelectedPair();
+    const auto line = proc.getDisplayCoach().statusLine();
+    return sel >= 0 ? "Pair " + juce::String (sel + 1) + ": " + line : line;
 }
 
 void GroundShakeContent::paint (juce::Graphics& g)
@@ -1345,7 +1730,7 @@ void GroundShakeContent::paint (juce::Graphics& g)
     g.drawText ("GROUND SHAKE", h.withTrimmedLeft (72.0f).withWidth (300.0f), juce::Justification::centredLeft);
     g.setColour (muted.withAlpha (0.7f));
     g.setFont (font (11.0f));
-    g.drawText ("phase 2.1", h.withTrimmedLeft (306.0f).withWidth (70.0f), juce::Justification::centredLeft);
+    g.drawText ("phase 3", h.withTrimmedLeft (306.0f).withWidth (70.0f), juce::Justification::centredLeft);
     {
         auto st = juce::Rectangle<float> (392.0f, headerR.getY() + 6.0f, 646.0f, headerR.getHeight() - 12.0f);
         g.setColour (juce::Colour (0xff0b0b0e));
@@ -1374,143 +1759,232 @@ void GroundShakeContent::paint (juce::Graphics& g)
 
     // controls row labels
     {
+        const float y0 = controlsR.getY();
         g.setFont (font (11.5f, true));
         g.setColour (muted);
-        g.drawText ("RANGE", juce::Rectangle<float> (108.0f, 730.0f, 190.0f, 16.0f), juce::Justification::centredLeft);
+        g.drawText ("RANGE", juce::Rectangle<float> (108.0f, y0 + 8.0f, 190.0f, 16.0f), juce::Justification::centredLeft);
         g.setColour (text);
         g.setFont (font (13.0f, true));
         const int sp = (int) std::round (proc.getSplit());
-        g.drawText ("split " + juce::String (sp) + " Hz", juce::Rectangle<float> (108.0f, 746.0f, 190.0f, 18.0f), juce::Justification::centredLeft);
+        g.drawText ("split " + juce::String (sp) + " Hz", juce::Rectangle<float> (108.0f, y0 + 24.0f, 190.0f, 18.0f), juce::Justification::centredLeft);
         g.setFont (font (10.5f));
         g.setColour (muted.brighter (0.2f));
         g.drawText ("feel 20-" + juce::String (sp) + "  punch " + juce::String (sp) + "-" + juce::String (sp * 2),
-                    juce::Rectangle<float> (108.0f, 764.0f, 200.0f, 14.0f), juce::Justification::centredLeft);
+                    juce::Rectangle<float> (108.0f, y0 + 42.0f, 200.0f, 14.0f), juce::Justification::centredLeft);
         g.setColour (proc.isRangeAuto() ? green : yellow);
-        g.drawText (proc.isRangeAuto() ? "Auto (from reference)" : "Manual", juce::Rectangle<float> (176.0f, 782.0f, 130.0f, 18.0f),
+        g.drawText (proc.isRangeAuto() ? "Auto (from reference)" : "Manual", juce::Rectangle<float> (176.0f, y0 + 60.0f, 130.0f, 18.0f),
                     juce::Justification::centredLeft);
 
         g.setFont (font (11.5f, true));
         g.setColour (muted);
-        g.drawText ("TOLERANCE", juce::Rectangle<float> (404.0f, 730.0f, 120.0f, 16.0f), juce::Justification::centredLeft);
+        g.drawText ("TOLERANCE", juce::Rectangle<float> (404.0f, y0 + 8.0f, 120.0f, 16.0f), juce::Justification::centredLeft);
         g.setColour (text);
         g.setFont (font (13.0f, true));
         g.drawText (juce::String::fromUTF8 ("\xc2\xb1") + juce::String (proc.getTolerance(), 2) + " dB",
-                    juce::Rectangle<float> (404.0f, 746.0f, 120.0f, 18.0f), juce::Justification::centredLeft);
+                    juce::Rectangle<float> (404.0f, y0 + 24.0f, 120.0f, 18.0f), juce::Justification::centredLeft);
         g.setFont (font (10.5f));
         g.setColour (muted.brighter (0.2f));
-        g.drawText ("how strict green is", juce::Rectangle<float> (404.0f, 764.0f, 120.0f, 14.0f), juce::Justification::centredLeft);
+        g.drawText ("how strict green is", juce::Rectangle<float> (404.0f, y0 + 42.0f, 120.0f, 14.0f), juce::Justification::centredLeft);
 
         g.setFont (font (11.5f, true));
         g.setColour (muted);
-        g.drawText ("REKORDBOX REF", juce::Rectangle<float> (540.0f, 730.0f, 140.0f, 16.0f), juce::Justification::centredLeft);
+        g.drawText ("REKORDBOX REF", juce::Rectangle<float> (540.0f, y0 + 8.0f, 140.0f, 16.0f), juce::Justification::centredLeft);
         g.setFont (font (10.5f));
         g.setColour (muted.brighter (0.2f));
-        g.drawText ("Auto Gain level (dB)", juce::Rectangle<float> (540.0f, 746.0f, 140.0f, 14.0f), juce::Justification::centredLeft);
+        g.drawText ("Auto Gain level (dB)", juce::Rectangle<float> (540.0f, y0 + 24.0f, 140.0f, 14.0f), juce::Justification::centredLeft);
     }
 
-    // match panel text
+    // song start (in the pairs row)
+    {
+        const float y = refR.getBottom() - 38.0f;
+        g.setFont (font (10.5f, true));
+        g.setColour (muted);
+        g.drawText ("SONG START BAR", juce::Rectangle<float> (652.0f, y, 120.0f, 30.0f), juce::Justification::centredRight);
+        g.setFont (font (14.0f, true));
+        g.setColour (text);
+        const int sb = proc.getSongStartBar();
+        g.drawText (sb > 0 ? juce::String (sb) : juce::String ("AUTO"), juce::Rectangle<float> (802.0f, y, 42.0f, 30.0f),
+                    juce::Justification::centred);
+        if (proc.hasLearnedTrack() || proc.getLearnedBars() > 0)
+        {
+            g.setFont (font (10.0f));
+            g.setColour (muted);
+            g.drawText ("learned from bar " + juce::String (proc.getEffectiveStartBar()),
+                        juce::Rectangle<float> (878.0f, y, 74.0f, 30.0f), juce::Justification::centredLeft, true);
+        }
+    }
+
+    // correction panel text
     {
         auto t = matchR.reduced (16.0f, 0.0f).withHeight (28.0f);
+        const int sel = proc.getSelectedPair();
+        const bool pairMode = ! proc.getPairs().empty();
         g.setColour (muted);
         g.setFont (font (13.0f, true));
-        g.drawText ("MATCH", t, juce::Justification::centredLeft);
-        const auto st = proc.getMatchState();
-        const juce::String stateText = st == MatchState::off     ? "off: audio untouched"
-                                     : st == MatchState::ready   ? "ready: press PREVIEW to hear it"
+        g.drawText (sel >= 0 ? "CORRECTION  -  PAIR " + juce::String (sel + 1)
+                             : (pairMode ? juce::String ("CORRECTION  -  select a pair") : juce::String ("CORRECTION  -  whole track")),
+                    t, juce::Justification::centredLeft);
+        const auto st = proc.getEditedMatchState();
+        const juce::String stateText = pairMode && sel < 0 ? "unmarked parts are left alone"
+                                     : st == MatchState::off     ? "off: audio untouched"
+                                     : st == MatchState::ready   ? "ready: PREVIEW or APPLY"
                                      : st == MatchState::preview ? "previewing (level-matched)"
-                                                                 : "APPLIED: correction is on";
+                                                                 : "ON";
         g.setColour (st == MatchState::applied ? green : (st == MatchState::off ? muted : yellow));
         g.setFont (font (11.5f, st == MatchState::applied));
         g.drawText (stateText, t, juce::Justification::centredRight);
 
-        const auto& m = proc.getMatchSettings();
-        auto line = juce::Rectangle<float> (matchR.getX() + 16.0f, matchR.getBottom() - 30.0f, matchR.getWidth() - 32.0f, 22.0f);
-        g.setFont (font (11.5f));
-        g.setColour (st == MatchState::off ? muted : text);
-        auto db = [] (float v) { return juce::String (v >= 0 ? "+" : "") + juce::String (v, 1) + " dB"; };
-        g.drawText ("feel " + db (m.feelDb) + "   punch " + db (m.punchDb) + "   mono " + (m.mono ? "on" : "off")
-                        + "   ceiling " + juce::String (proc.getMatchCeilingDb(), 1) + " dB",
-                    line, juce::Justification::centredLeft);
+        const auto& c = proc.getEditedCorrection();
+        auto db = [] (float v) { return juce::String (v >= 0 ? "+" : "") + juce::String (v, 1); };
+        const char* names[] = { "FEEL", "PUNCH", "ATTACK", "TAIL", "MUD", "LOW CUT" };
+        const juce::String vals[] = { db (c.feelDb), db (c.punchDb), db (c.attackDb), db (c.tailDb), db (c.mudDb),
+                                      c.lowCutHz > 0 ? juce::String (juce::roundToInt (c.lowCutHz)) + " Hz" : juce::String ("off") };
+        for (int i = 0; i < 6; ++i)
+        {
+            auto r = juce::Rectangle<float> (976.0f + i * 66.0f, matchR.getY() + 114.0f, 66.0f, 13.0f);
+            g.setFont (font (10.0f, true));
+            g.setColour (muted);
+            g.drawText (names[i], r, juce::Justification::centred);
+            g.setFont (font (10.5f));
+            g.setColour (text);
+            g.drawText (vals[i], r.translated (0.0f, 13.0f), juce::Justification::centred);
+        }
+        g.setFont (font (10.0f, true));
+        g.setColour (muted);
+        g.drawText ("DUCK", juce::Rectangle<float> (980.0f, matchR.getY() + 150.0f, 64.0f, 14.0f), juce::Justification::centredLeft);
+        g.setFont (font (9.5f));
+        g.drawText ("built-in,", juce::Rectangle<float> (980.0f, matchR.getY() + 164.0f, 64.0f, 12.0f), juce::Justification::centredLeft);
+        g.drawText ("per 16th", juce::Rectangle<float> (980.0f, matchR.getY() + 176.0f, 64.0f, 12.0f), juce::Justification::centredLeft);
+        for (int k = 0; k < 4; ++k)
+        {
+            auto r = juce::Rectangle<float> (1046.0f + k * 58.0f, matchR.getY() + 190.0f, 58.0f, 12.0f);
+            g.setFont (font (9.5f, true));
+            g.setColour (muted);
+            g.drawText ("16th " + juce::String (k + 1), r, juce::Justification::centred);
+            g.setFont (font (10.0f));
+            g.setColour (text);
+            g.drawText (db (c.duckDb[(size_t) k]), r.translated (0.0f, 12.0f), juce::Justification::centred);
+        }
+        g.setFont (font (10.5f));
+        g.setColour (muted);
+        g.drawText ("ceiling", juce::Rectangle<float> (1290.0f, matchR.getY() + 158.0f, 90.0f, 14.0f), juce::Justification::centred);
+        g.setColour (text);
+        g.drawText (juce::String (proc.getMatchCeilingDb(), 1) + " dB", juce::Rectangle<float> (1290.0f, matchR.getY() + 172.0f, 90.0f, 14.0f),
+                    juce::Justification::centred);
     }
 }
 
 void GroundShakeContent::resized()
 {
     headerR    = { 16.0f, 12.0f, 1368.0f, 56.0f };
-    feetR      = { 16.0f, 80.0f, 940.0f, 222.0f };
-    gridR      = { 16.0f, 314.0f, 940.0f, 134.0f };
-    refR       = { 16.0f, 460.0f, 940.0f, 150.0f };
-    stripR     = { 16.0f, 622.0f, 940.0f, 88.0f };
-    controlsR  = { 16.0f, 722.0f, 940.0f, 86.0f };
-    checklistR = { 968.0f, 80.0f, 416.0f, 196.0f };
-    fixesR     = { 968.0f, 288.0f, 416.0f, 410.0f };
-    matchR     = { 968.0f, 710.0f, 416.0f, 98.0f };
+    feetR      = { 16.0f, 80.0f, 940.0f, 170.0f };
+    gridR      = { 16.0f, 262.0f, 940.0f, 116.0f };
+    refR       = { 16.0f, 390.0f, 940.0f, 240.0f };
+    stripR     = { 16.0f, 642.0f, 940.0f, 84.0f };
+    controlsR  = { 16.0f, 738.0f, 940.0f, 86.0f };
+    checklistR = { 968.0f, 80.0f, 416.0f, 192.0f };
+    fixesR     = { 968.0f, 284.0f, 416.0f, 306.0f };
+    matchR     = { 968.0f, 602.0f, 416.0f, 222.0f };
 
     feet.setBounds (feetR.toNearestInt());
     grid.setBounds (gridR.toNearestInt());
-    refView.setBounds (refR.withTrimmedBottom (48.0f).toNearestInt());
+    arrangement.setBounds (refR.withHeight (162.0f).toNearestInt());
     strip.setBounds (stripR.toNearestInt());
     checklist.setBounds (checklistR.toNearestInt());
-    fixViewport.setBounds (juce::Rectangle<int> (976, 318, 402, 372));
+    fixViewport.setBounds (juce::Rectangle<int> (976, 314, 402, 268));
     fixList.refresh (fixViewport.getMaximumVisibleWidth());
 
     aButton.setBounds (juce::Rectangle<int> (1056, 22, 160, 36));
     bButton.setBounds (juce::Rectangle<int> (1222, 22, 156, 36));
 
-    // controls row under the waveform
-    const int y = (int) refR.getBottom() - 44;
-    loadButton.setBounds (32, y, 84, 32);
-    bpmTitle.setBounds (126, y, 38, 32);
-    bpmLabel.setBounds (162, y + 1, 78, 30);
-    detectedLabel.setBounds (244, y, 108, 32);
-    x2Button.setBounds (354, y, 44, 32);
-    halfButton.setBounds (402, y, 44, 32);
-    nudgeLeft.setBounds (452, y, 36, 32);
-    nudgeRight.setBounds (492, y, 36, 32);
-    offsetLabel.setBounds (530, y, 90, 32);
-    dropButton.setBounds (622, y, 150, 32);
-    breakdownButton.setBounds (778, y, 162, 32);
-    // window length, in the reference panel's title row
-    const int ty = (int) refR.getY() + 6;
+    // reference title row: slots + window length
+    const int ty = (int) refR.getY() + 4;
+    slotA.setBounds (122, ty, 26, 22);
+    slotB.setBounds (150, ty, 26, 22);
     bars1.setBounds (440, ty, 30, 22);
     bars2.setBounds (474, ty, 30, 22);
     bars4.setBounds (508, ty, 30, 22);
     bars8.setBounds (542, ty, 30, 22);
     loopButton.setBounds (580, ty, 54, 22);
 
-    // knobs + buttons row
-    rangeKnob.setBounds (28, 728, 76, 76);
-    autoButton.setBounds (106, 780, 64, 24);
-    toleranceKnob.setBounds (324, 728, 76, 76);
-    dj6.setBounds (540, 768, 44, 28);
-    dj9.setBounds (588, 768, 44, 28);
-    dj12.setBounds (636, 768, 48, 28);
-    snapshotButton.setBounds (700, 732, 122, 30);
-    resetButton.setBounds (826, 732, 120, 30);
-    reanalyzeButton.setBounds (700, 768, 246, 30);
+    // reference controls row
+    const int y = (int) refR.getY() + 164;
+    loadButton.setBounds (32, y, 84, 30);
+    bpmTitle.setBounds (126, y, 38, 30);
+    bpmLabel.setBounds (162, y + 1, 78, 28);
+    detectedLabel.setBounds (244, y, 108, 30);
+    x2Button.setBounds (354, y, 44, 30);
+    halfButton.setBounds (402, y, 44, 30);
+    nudgeLeft.setBounds (452, y, 36, 30);
+    nudgeRight.setBounds (492, y, 36, 30);
+    offsetLabel.setBounds (530, y, 90, 30);
+    dropButton.setBounds (622, y, 150, 30);
+    breakdownButton.setBounds (778, y, 162, 30);
 
-    // match panel
-    const int my = 742;
-    matchButton.setBounds (980, my, 76, 30);
-    previewButton.setBounds (1058, my, 104, 30);
-    applyButton.setBounds (1164, my, 68, 30);
-    revertButton.setBounds (1234, my, 72, 30);
-    weightButton.setBounds (1308, my, 70, 30);
+    // learn + pairs row
+    const int y2 = (int) refR.getBottom() - 38;
+    learnButton.setBounds (32, y2, 80, 30);
+    learnPairButton.setBounds (116, y2, 96, 30);
+    addPairButton.setBounds (216, y2, 70, 30);
+    deletePairButton.setBounds (290, y2, 70, 30);
+    autoPairButton.setBounds (364, y2, 92, 30);
+    matchAllButton.setBounds (460, y2, 96, 30);
+    followButton.setBounds (560, y2, 82, 30);
+    startDown.setBounds (774, y2 + 2, 26, 26);
+    startUp.setBounds (846, y2 + 2, 26, 26);
+
+    // knobs + buttons row
+    const int cy = (int) controlsR.getY();
+    rangeKnob.setBounds (28, cy + 6, 76, 76);
+    autoButton.setBounds (106, cy + 58, 64, 24);
+    toleranceKnob.setBounds (324, cy + 6, 76, 76);
+    dj6.setBounds (540, cy + 46, 44, 28);
+    dj9.setBounds (588, cy + 46, 44, 28);
+    dj12.setBounds (636, cy + 46, 48, 28);
+    snapshotButton.setBounds (700, cy + 10, 122, 30);
+    resetButton.setBounds (826, cy + 10, 120, 30);
+    reanalyzeButton.setBounds (700, cy + 46, 246, 30);
+
+    // correction panel
+    const int my = (int) matchR.getY() + 30;
+    matchButton.setBounds (980, my, 62, 28);
+    previewButton.setBounds (1046, my, 86, 28);
+    applyButton.setBounds (1136, my, 56, 28);
+    revertButton.setBounds (1196, my, 60, 28);
+    weightButton.setBounds (1260, my, 60, 28);
+    monoButton.setBounds (1324, my, 52, 28);
+    int i = 0;
+    for (auto* k : { &feelKnob, &punchKnob, &attackKnob, &tailKnob, &mudKnob, &lowCutKnob })
+        k->setBounds (984 + 66 * i++, (int) matchR.getY() + 62, 50, 50);
+    for (int k = 0; k < 4; ++k)
+        duckKnobs[(size_t) k].setBounds (1055 + 58 * k, (int) matchR.getY() + 148, 40, 40);
 }
 
 void GroundShakeContent::tick (double t)
 {
     feet.tick (t);
     grid.repaint();
-    if (proc.getRefPlayPositionSec() >= 0 || proc.isLoading()) refView.repaint();
+    const bool moving = proc.getRefPlayPositionSec() >= 0 || proc.isLoading() || proc.isHostPlaying()
+                        || proc.getLearnState() != GroundShakeProcessor::LearnState::off;
+    if (moving && tickCount % 2 == 0) arrangement.repaint();
     if (++tickCount % 6 == 0)                    // ~10 times a second
     {
+        if (proc.getLearnMessage() != shownLearnMessage)
+        {
+            shownLearnMessage = proc.getLearnMessage();
+            learnMessageTime = juce::Time::getMillisecondCounterHiRes() / 1000.0;
+        }
         checklist.repaint();
         strip.repaint();
+        arrangement.repaint();
         fixList.refresh (fixViewport.getMaximumVisibleWidth());
         grid.setHighlight (fixList.expandedHighlight());
         refreshMatchControls();
+        refreshKnobs();
+        slotA.setToggleState (proc.getActiveSlot() == 0, juce::dontSendNotification);
+        slotB.setToggleState (proc.getActiveSlot() == 1, juce::dontSendNotification);
         repaint (headerR.toNearestInt());
+        repaint (refR.withTrimmedTop (200.0f).toNearestInt());
         if (! rangeKnob.isMouseButtonDown() && std::abs (rangeKnob.getValue() - proc.getSplit()) > 0.4)
         {
             rangeKnob.setValue (proc.getSplit(), juce::dontSendNotification);
@@ -1528,9 +2002,9 @@ GroundShakeEditor::GroundShakeEditor (GroundShakeProcessor& p)
     addAndMakeVisible (content);
     content.setBounds (0, 0, GroundShakeContent::baseW, GroundShakeContent::baseH);
     setResizable (true, true);
-    setResizeLimits (840, 492, 2100, 1230);
+    setResizeLimits (840, 504, 2100, 1260);
     getConstrainer()->setFixedAspectRatio ((double) GroundShakeContent::baseW / GroundShakeContent::baseH);
-    setSize (1260, 738);
+    setSize (1260, 756);
     startTimerHz (60);
 }
 

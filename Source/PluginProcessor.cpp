@@ -38,6 +38,17 @@ GroundShakeProcessor::GroundShakeProcessor()
                         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                         .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
+    // "song starts at bar" is remembered for every project
+    juce::PropertiesFile::Options o;
+    o.applicationName = "GroundShake";
+    o.folderName = "WOLLER";
+    o.filenameSuffix = "settings";
+    o.osxLibrarySubFolder = "Application Support";
+    globalSettings = std::make_unique<juce::PropertiesFile> (o);
+    songStartBar = globalSettings->getIntValue ("songStartBar", 9);
+    originBar = songStartBar > 0 ? songStartBar : 1;
+
+    pushCorrectionTable();
     startTimer (100);
     analyzer.startThread (juce::Thread::Priority::low);
 }
@@ -51,6 +62,7 @@ GroundShakeProcessor::~GroundShakeProcessor()
     stopTimer();
     pool.removeAllJobs (true, 10000);
     livePlayback.store (nullptr);
+    liveTable.store (nullptr);
 }
 
 bool GroundShakeProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -147,14 +159,34 @@ void GroundShakeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     const double stepsPerSample = bpmNow / 60.0 * 4.0 / sr;
     const double startSteps = havePpq ? ppq * 4.0 : freeRunSteps;
 
-    // --- Match correction stage (bypassed and untouched unless Preview or Apply is on)
+    // --- learn pass: record the raw mix, before any correction
     float* wL = buffer.getWritePointer (0);
     float* wR = buffer.getWritePointer (numCh > 1 ? 1 : 0);
+    const bool isLearning = learning.load();
+    if (isLearning && havePpq && playing)
+        recorder.process (wL, wR, n, ppq - learnOriginPpq.load(), bpmNow / 60.0 / sr, bpmNow);
+
+    // --- correction stage: the pair under the playhead (or the global Match). Bypassed and
+    //     untouched unless Preview or Apply is on; always off while learning.
     {
-        gs::MatchSettings ms;
-        ms.feelDb = mFeel.load();  ms.punchDb = mPunch.load();  ms.mono = mMono.load();
-        ms.weight = mWeight.load();  ms.split = currentSplit;  ms.feelHz = mFeelHz.load();
-        matchStage.process (wL, wR, n, ms, mActive.load(), mLevelMatch.load());
+        gs::MatchSettings target;
+        bool act = false, lm = false;
+        if (auto* table = liveTable.load(); table != nullptr && ! isLearning)
+        {
+            if (! table->pairMode)
+            {
+                if (! table->entries.empty())
+                {
+                    const auto& e = table->entries.front();
+                    target = e.s;  act = e.active;  lm = e.levelMatch;
+                }
+            }
+            else if (havePpq)
+                for (const auto& e : table->entries)
+                    if (ppq >= e.startPpq && ppq < e.endPpq) { target = e.s;  act = e.active;  lm = e.levelMatch;  break; }
+        }
+        target.split = currentSplit;
+        matchStage.process (wL, wR, n, target, act, lm, startSteps, stepsPerSample, 60.0 / bpmNow * sr);
         ceilingDb.store (matchStage.ceilingDb());
     }
 
@@ -349,8 +381,9 @@ float GroundShakeProcessor::getRefSubDbNow() const
 }
 
 //==============================================================================
-void GroundShakeProcessor::loadReferenceAsync (const juce::File& file)
+void GroundShakeProcessor::loadReferenceAsync (const juce::File& file, int slot)
 {
+    if (slot < 0) slot = activeSlot;
     loading.store (true);
     loadError.clear();
     if (onReferenceChanged) onReferenceChanged();
@@ -358,7 +391,7 @@ void GroundShakeProcessor::loadReferenceAsync (const juce::File& file)
     auto flag = alive;
     const double hostRate = sr;
     const float sp = split;
-    pool.addJob ([this, file, flag, hostRate, sp]
+    pool.addJob ([this, file, flag, hostRate, sp, slot]
     {
         auto ref = std::make_shared<gs::ReferenceTrack>();
         juce::String err;
@@ -366,13 +399,31 @@ void GroundShakeProcessor::loadReferenceAsync (const juce::File& file)
         std::shared_ptr<const juce::AudioBuffer<float>> res;
         if (ok) res = resampleTo (ref->audio, ref->sampleRate, hostRate);
 
-        juce::MessageManager::callAsync ([this, flag, ok, ref, res, err, hostRate]
+        juce::MessageManager::callAsync ([this, flag, ok, ref, res, err, hostRate, slot]
         {
             if (! flag->load()) return;
             loading.store (false);
             if (! ok)
             {
                 loadError = err;
+                if (onReferenceChanged) onReferenceChanged();
+                return;
+            }
+            if (slot != activeSlot)                      // loaded into the slot that isn't on show
+            {
+                auto& ps = parked[(size_t) slot];
+                ps.track = ref;
+                ps.resampled = res;
+                ps.resampledRate = hostRate;
+                ps.bpm = otherPendingBpm > 0 ? otherPendingBpm : ref->detectedBpm;
+                ps.offset = otherPendingOffset;
+                ps.dropBar = gs::findDropBar (*ref, ps.bpm, ps.offset, windowBars);
+                ps.breakdownBar = gs::findBreakdownBar (*ref, ps.bpm, ps.offset, windowBars);
+                ps.windowStartBar = otherPendingStart >= 0 ? otherPendingStart : ps.dropBar;
+                otherPendingBpm = 0;  otherPendingOffset = 0;  otherPendingStart = -1;
+                ps.refM = {};
+                for (int i = 0; i < (int) pairs.size(); ++i)
+                    if (pairs[(size_t) i].slot == slot) analyzePair (i);
                 if (onReferenceChanged) onReferenceChanged();
                 return;
             }
@@ -396,6 +447,8 @@ void GroundShakeProcessor::loadReferenceAsync (const juce::File& file)
             rebuildWindow();
             if (std::abs (resampledRate - sr) > 0.5)     // host rate changed while loading
                 requestResample (sr);
+            for (int i = 0; i < (int) pairs.size(); ++i)
+                if (pairs[(size_t) i].slot == activeSlot) analyzePair (i);
             if (onReferenceChanged) onReferenceChanged();
         });
     });
@@ -431,6 +484,18 @@ void GroundShakeProcessor::setWindowStartBar (int bar)
 {
     windowStartBar = bar;
     rebuildWindow();
+    // moving the reference window while a pair is selected re-points that pair
+    if (! switchingForPair && selectedPair >= 0 && selectedPair < (int) pairs.size())
+    {
+        auto& p = pairs[(size_t) selectedPair];
+        if (p.refStart != windowStartBar || p.slot != activeSlot)
+        {
+            p.refStart = windowStartBar;
+            p.slot = activeSlot;
+            if (std::find (pairsToAnalyze.begin(), pairsToAnalyze.end(), selectedPair) == pairsToAnalyze.end())
+                pairsToAnalyze.push_back (selectedPair);
+        }
+    }
     if (onReferenceChanged) onReferenceChanged();
 }
 
@@ -472,6 +537,14 @@ void GroundShakeProcessor::setWindowBars (int bars, bool fromLoop)
     else if (wasBreak && breakdownBar >= 0) windowStartBar = breakdownBar;
     coach.reset();
     rebuildWindow();
+    if (! switchingForPair && selectedPair >= 0 && selectedPair < (int) pairs.size())
+    {
+        auto& p = pairs[(size_t) selectedPair];
+        p.refBars = windowBars;
+        p.refStart = windowStartBar;
+        if (std::find (pairsToAnalyze.begin(), pairsToAnalyze.end(), selectedPair) == pairsToAnalyze.end())
+            pairsToAnalyze.push_back (selectedPair);
+    }
     if (onReferenceChanged) onReferenceChanged();
 }
 
@@ -631,6 +704,8 @@ void GroundShakeProcessor::updateCoach()
     in.sectionDismissed = sectionDismissed;
     in.hostBpm = hostBpm.load();
     in.djRefLevel = djRefLevel;
+    in.pairMode = selectedPair >= 0 && selectedPair < (int) pairs.size();
+    in.pairLabel = in.pairMode ? "pair " + juce::String (selectedPair + 1) : juce::String();
     coach.update (in, juce::Time::getMillisecondCounterHiRes() / 1000.0);
 }
 
@@ -664,17 +739,21 @@ void GroundShakeProcessor::resetMeasurements()
 //==============================================================================
 void GroundShakeProcessor::pushMatchToAudio()
 {
-    mFeel.store (matchSettings.feelDb);
-    mFeelHz.store (matchSettings.feelHz);
-    mPunch.store (matchSettings.punchDb);
-    mMono.store (matchSettings.mono);
-    mWeight.store (matchSettings.weight);
-    mActive.store (matchState == MatchState::preview || matchState == MatchState::applied);
-    mLevelMatch.store (matchState == MatchState::preview);
+    pushCorrectionTable();
 }
 
 void GroundShakeProcessor::computeMatch()
 {
+    if (selectedPair >= 0 && selectedPair < (int) pairs.size())
+    {
+        auto& p = pairs[(size_t) selectedPair];
+        if (! p.analyzed) return;
+        p.corr = autoCorrection (p);
+        if (p.state != MatchState::applied) p.state = MatchState::ready;
+        refreshPairCoach (p, selectedPair);
+        pushCorrectionTable();
+        return;
+    }
     const auto live = getLiveProfile();
     if (! live.valid || ! refProfile.valid) return;
     // while applied, what we hear already includes the correction: refine it
@@ -703,6 +782,14 @@ void GroundShakeProcessor::computeMatch()
 
 void GroundShakeProcessor::setMatchPreview (bool on)
 {
+    if (selectedPair >= 0 && selectedPair < (int) pairs.size())
+    {
+        auto& p = pairs[(size_t) selectedPair];
+        if (on && p.state == MatchState::ready) p.state = MatchState::preview;
+        else if (! on && p.state == MatchState::preview) p.state = MatchState::ready;
+        pushCorrectionTable();
+        return;
+    }
     if (on && matchState == MatchState::ready) matchState = MatchState::preview;
     else if (! on && matchState == MatchState::preview) matchState = MatchState::ready;
     pushMatchToAudio();
@@ -710,6 +797,14 @@ void GroundShakeProcessor::setMatchPreview (bool on)
 
 void GroundShakeProcessor::applyMatch()
 {
+    if (selectedPair >= 0 && selectedPair < (int) pairs.size())
+    {
+        auto& p = pairs[(size_t) selectedPair];
+        if (p.state == MatchState::ready || p.state == MatchState::preview) p.state = MatchState::applied;
+        refreshPairCoach (p, selectedPair);
+        pushCorrectionTable();
+        return;
+    }
     if (matchState == MatchState::ready || matchState == MatchState::preview)
         matchState = MatchState::applied;
     pushMatchToAudio();
@@ -717,6 +812,15 @@ void GroundShakeProcessor::applyMatch()
 
 void GroundShakeProcessor::revertMatch()
 {
+    if (selectedPair >= 0 && selectedPair < (int) pairs.size())
+    {
+        auto& p = pairs[(size_t) selectedPair];
+        p.corr = {};
+        p.state = MatchState::off;
+        refreshPairCoach (p, selectedPair);
+        pushCorrectionTable();
+        return;
+    }
     const float w = matchSettings.weight;
     matchSettings = {};
     matchSettings.weight = w;
@@ -726,6 +830,13 @@ void GroundShakeProcessor::revertMatch()
 
 void GroundShakeProcessor::setMatchWeight (bool on)
 {
+    if (selectedPair >= 0 && selectedPair < (int) pairs.size())
+    {
+        auto c = pairs[(size_t) selectedPair].corr;
+        c.weight = on ? 0.5f : 0.0f;
+        setEditedCorrection (c);
+        return;
+    }
     matchSettings.weight = on ? 0.5f : 0.0f;
     pushMatchToAudio();
 }
@@ -773,6 +884,80 @@ void GroundShakeProcessor::timerCallback()
         for (int c : { 1, 2, 4, 8 }) if (juce::jmin (hostLoopBars.load(), gs::kBars) >= c) b = c;
         if (b != windowBars) applyHostLoop();
     }
+    retiredTables.erase (std::remove_if (retiredTables.begin(), retiredTables.end(),
+                                         [now] (const auto& r) { return now - r.second > 1500; }),
+                         retiredTables.end());
+
+    // learn pass: keep memory allocated ahead of the playhead, copy the waveform, auto-stop
+    if (learnState != LearnState::off)
+    {
+        const double songBeat = hostSteps.load() / 4.0 - learnOriginPpq.load();
+        if (learnBpm <= 0) learnBpm = hostBpm.load();
+        recorder.ensureChunksAround (juce::jmax (0.0, songBeat * 60.0 / juce::jmax (40.0, hostBpm.load())));
+        const int last = recorder.lastBar();
+        if (last >= 0)
+        {
+            const size_t per = gs::SongRecorder::kOverviewPerBar;
+            if (ovMin.size() < (size_t) (last + 1) * per) { ovMin.resize ((size_t) (last + 1) * per, 0.0f); ovMax.resize ((size_t) (last + 1) * per, 0.0f); }
+            for (int b = 0; b <= last; ++b)
+                if (recorder.barHeard (b))
+                    for (size_t q = 0; q < per; ++q)
+                    {
+                        ovMin[(size_t) b * per + q] = recorder.overviewMin()[(size_t) b * per + q];
+                        ovMax[(size_t) b * per + q] = recorder.overviewMax()[(size_t) b * per + q];
+                    }
+            learnedBars = juce::jmax (learnedBars, last + 1 - trimBars);
+        }
+        if (recorder.tempoChanged.load())
+        {
+            learnMessage = "The tempo changed during the learn pass: set one tempo and learn again.";
+            learning.store (false);
+            learnState = LearnState::off;
+        }
+        else if (learnState == LearnState::pair && learnPairIndex >= 0 && learnPairIndex < (int) pairs.size())
+        {
+            const auto& p = pairs[(size_t) learnPairIndex];
+            bool all = true;
+            for (int b = p.songStart; b < p.songEnd; ++b) all = all && recorder.barHeard (b + trimBars);
+            learnMessage = "Re-learning pair " + juce::String (learnPairIndex + 1) + ": play bars "
+                           + juce::String (getEffectiveStartBar() + p.songStart) + "-" + juce::String (getEffectiveStartBar() + p.songEnd - 1) + ".";
+            if (all) stopLearn();
+        }
+        else
+            learnMessage = "Learning: play your song from bar " + juce::String (originBar)
+                           + " to the end, then press LEARN again.";
+    }
+
+    // follow playhead: the selected pair is the one playing
+    if (followPlayhead && hostPlaying.load() && learnState == LearnState::off && ! pairs.empty())
+    {
+        const double bar = getSongBarNow();
+        int under = -1;
+        for (int i = 0; i < (int) pairs.size(); ++i)
+            if (bar >= pairs[(size_t) i].songStart && bar < pairs[(size_t) i].songEnd) { under = i; break; }
+        if (under >= 0 && under != selectedPair) selectPair (under, true);
+    }
+    // entering a pair while playing: measure it fresh
+    {
+        const double bar = getSongBarNow();
+        int under = -1;
+        for (int i = 0; i < (int) pairs.size(); ++i)
+            if (bar >= pairs[(size_t) i].songStart && bar < pairs[(size_t) i].songEnd) { under = i; break; }
+        if (hostPlaying.load() && under != lastLivePair)
+        {
+            lastLivePair = under;
+            if (under >= 0 && under == selectedPair) resetRequested.store (true);
+        }
+    }
+
+    // pair analysis queue (one job at a time)
+    if (pairAnalysisRunning == 0 && ! pairsToAnalyze.empty())
+    {
+        const int i = pairsToAnalyze.front();
+        pairsToAnalyze.erase (pairsToAnalyze.begin());
+        analyzePair (i);
+    }
+
     if (++timerTicks % 3 == 0) updateCoach();
 }
 
@@ -804,6 +989,7 @@ void GroundShakeProcessor::getStateInformation (juce::MemoryBlock& dest)
     xml.setAttribute ("matchMono", matchSettings.mono);
     xml.setAttribute ("matchWeight", matchSettings.weight);
     xml.setAttribute ("matchFeelHz", matchSettings.feelHz);
+    savePhase3 (xml);
     copyXmlToBinary (xml, dest);
 }
 
@@ -829,6 +1015,7 @@ void GroundShakeProcessor::setStateInformation (const void* data, int size)
     matchState = xml->getBoolAttribute ("matchApplied", false) ? MatchState::applied : MatchState::off;
     pushMatchToAudio();
 
+    loadPhase3 (*xml);
     const juce::File f (xml->getStringAttribute ("reference"));
     if (f.existsAsFile())
     {

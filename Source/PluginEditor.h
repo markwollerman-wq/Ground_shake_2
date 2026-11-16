@@ -71,20 +71,37 @@ private:
 };
 
 //==============================================================================
-class ReferenceView : public juce::Component
+// Phase 3: the reference on top, your learned track below, pairs in colour between them
+class ArrangementView : public juce::Component
 {
 public:
-    explicit ReferenceView (GroundShakeProcessor& p) : proc (p) {}
+    explicit ArrangementView (GroundShakeProcessor& p) : proc (p) {}
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    bool getDraft (int& a, int& b) const;
+    void clearDraft() { draftA = draftB = -1; repaint(); }
+    std::function<void()> onDraftChanged;
+
+    static juce::Colour pairColour (int index);
 
 private:
+    juce::Rectangle<float> refLane() const  { return { 16.0f, 30.0f, (float) getWidth() - 32.0f, 60.0f }; }
+    juce::Rectangle<float> songLane() const { return { 16.0f, 98.0f, (float) getWidth() - 32.0f, 60.0f }; }
     float xForTime (double sec) const;
     double timeForX (float x) const;
-    juce::Rectangle<float> waveArea() const;
+    int songBarsShown() const;
+    float xForBar (double bar) const;
+    double barForX (float x) const;
+    int pairAt (float x, int& edge) const;            // edge: -1 start, +1 end, 0 inside
+
     GroundShakeProcessor& proc;
-    int dragGrabBarOffset = 0;
+    enum class Drag { none, refWindow, draft, resizeStart, resizeEnd };
+    Drag drag = Drag::none;
+    int dragGrabBarOffset = 0, dragPair = -1, tempA = 0, tempB = 0;
+    int draftA = -1, draftB = -1, draftAnchor = -1;
 };
 
 //==============================================================================
@@ -139,7 +156,7 @@ private:
 class GroundShakeContent : public juce::Component, public juce::FileDragAndDropTarget
 {
 public:
-    static constexpr int baseW = 1400, baseH = 820;
+    static constexpr int baseW = 1400, baseH = 840;
     explicit GroundShakeContent (GroundShakeProcessor&);
     ~GroundShakeContent() override;
     void paint (juce::Graphics&) override;
@@ -159,7 +176,7 @@ private:
     gsui::LedLookAndFeel lnf;
     FeetView feet;
     StepGridView grid;
-    ReferenceView refView;
+    ArrangementView arrangement;
     DiagnosticsStrip strip;
     ChecklistView checklist;
     FixListView fixList;
@@ -169,6 +186,19 @@ private:
                      nudgeLeft { "<" }, nudgeRight { ">" }, dropButton { "FIND THE DROP" },
                      breakdownButton { "FIND BREAKDOWN" };
     juce::TextButton bars1 { "1" }, bars2 { "2" }, bars4 { "4" }, bars8 { "8" }, loopButton { "LOOP" };
+    // Phase 3: slots, learn and pairs
+    juce::TextButton slotA { "A" }, slotB { "B" };
+    juce::TextButton learnButton { "LEARN" }, learnPairButton { "LEARN PAIR" }, addPairButton { "+ PAIR" },
+                     deletePairButton { "DELETE" }, autoPairButton { "AUTO-PAIR" }, matchAllButton { "MATCH ALL" },
+                     followButton { "FOLLOW" }, startDown { "<" }, startUp { ">" };
+    // correction panel
+    juce::Slider feelKnob, punchKnob, attackKnob, tailKnob, mudKnob, lowCutKnob;
+    std::array<juce::Slider, 4> duckKnobs;
+    juce::TextButton monoButton { "MONO" };
+    void applyKnobs();
+    void refreshKnobs();
+    juce::String shownLearnMessage;
+    double learnMessageTime = 0;
     juce::Label bpmLabel, bpmTitle, detectedLabel, offsetLabel;
     // controls row
     juce::Slider rangeKnob, toleranceKnob;

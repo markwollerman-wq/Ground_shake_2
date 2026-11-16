@@ -53,6 +53,184 @@ static void pump (int ms)
         juce::MessageManager::getInstance()->runDispatchLoopUntil (20);
 }
 
+// Phase 3: a song that starts at bar 9 (drop 16 bars, low-passed breakdown 8 bars, drop 16 bars),
+// learned by playing it through, auto-paired against the reference, matched, played again.
+static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const juce::File& outPng)
+{
+    const double sr = mix.sampleRate, bpm = mix.detectedBpm, barSec = 240.0 / bpm;
+    const int clipBars = juce::jmin (8, gs::numBarsInReference (mix, bpm, 0.0));
+    const int clipLen = (int) (clipBars * barSec * sr);
+    // build the song
+    juce::AudioBuffer<float> lp (2, clipLen);
+    for (int c = 0; c < 2; ++c)
+    {
+        gs::Biquad a, b;  a.setLowPass (sr, 300.0);  b.setLowPass (sr, 300.0);
+        for (int i = 0; i < clipLen; ++i) lp.setSample (c, i, b.process (a.process (mix.audio.getSample (c, i))));
+    }
+    const int songBars = 5 * clipBars;                      // drop, drop, breakdown, drop, drop
+    juce::AudioBuffer<float> song (2, songBars / clipBars * clipLen);
+    for (int part = 0; part < 5; ++part)
+        for (int c = 0; c < 2; ++c)
+            song.copyFrom (c, part * clipLen, part == 2 ? lp : mix.audio, c, 0, clipLen);
+    std::printf ("song: %d bars at %.2f BPM, starting at Ableton bar 9 (drop %d, breakdown %d (low-passed), drop %d)\n",
+                 songBars, bpm, 2 * clipBars, clipBars, 2 * clipBars);
+
+    GroundShakeProcessor proc;
+    const int block = 512;
+    proc.setPlayConfigDetails (2, 2, sr, block);
+    proc.prepareToPlay (sr, block);
+    FakeHead head;  head.bpm = bpm;
+    proc.setPlayHead (&head);
+    proc.setSongStartBar (9);
+    proc.loadReferenceAsync (refFile);
+    for (int i = 0; i < 400 && (proc.isLoading() || ! proc.hasReference()); ++i) juce::MessageManager::getInstance()->runDispatchLoopUntil (20);
+    pump (600);
+    std::printf ("reference: %s, %d bars, drop bar %d, breakdown bar %d\n", proc.getReference()->name.toRawUTF8(),
+                 proc.getNumReferenceBars(), proc.getDropBar() + 1, proc.getBreakdownBar() + 1);
+
+    juce::MidiBuffer midi;
+    juce::AudioBuffer<float> buf (2, block);
+    auto playSong = [&] (bool checkUntouched, double* maxDiffIn, double* maxDiffOut, int* blocksIn)
+    {
+        // two bars of lead-in before bar 9, then the song
+        const double startPpq = 32.0 - 8.0;
+        const int lead = (int) (2 * barSec * sr);
+        for (int pos = 0; pos + block <= lead + song.getNumSamples(); pos += block)
+        {
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < block; ++i)
+                {
+                    const int sidx = pos + i - lead;
+                    buf.setSample (c, i, sidx >= 0 && sidx < song.getNumSamples() ? song.getSample (c, sidx) : 0.01f * std::sin (i * 0.05f));
+                }
+            juce::AudioBuffer<float> in;  in.makeCopyOf (buf);
+            head.ppq = startPpq + pos / sr * bpm / 60.0;
+            proc.processBlock (buf, midi);
+            if (checkUntouched)
+            {
+                double d = 0;
+                for (int c = 0; c < 2; ++c) for (int i = 0; i < block; ++i) d = std::max (d, (double) std::abs (in.getSample (c, i) - buf.getSample (c, i)));
+                // inside a pair (song bars) or not?
+                const double songBar = (head.ppq - 32.0) / 4.0;
+                bool inside = false;
+                for (auto& p : proc.getPairs()) inside = inside || (songBar >= p.songStart + 1.0 && songBar < p.songEnd);
+                bool nearAny = false;   // allow the one-beat glide around pair edges
+                for (auto& p : proc.getPairs()) nearAny = nearAny || std::abs (songBar - p.songStart) < 1.0 || std::abs (songBar - p.songEnd) < 1.0;
+                if (! nearAny)
+                {
+                    if (inside) { *maxDiffIn = std::max (*maxDiffIn, d); ++*blocksIn; }
+                    else *maxDiffOut = std::max (*maxDiffOut, d);
+                }
+            }
+            if ((pos / block) % 200 == 0) pump (30);
+        }
+    };
+
+    proc.startLearn();
+    pump (100);
+    playSong (false, nullptr, nullptr, nullptr);
+    pump (200);
+    std::printf ("learned waveform bars: %d (status: %s)\n", proc.getLearnedBars(), proc.getLearnMessage().toRawUTF8());
+    proc.stopLearn();
+    for (int i = 0; i < 300 && ! proc.hasLearnedTrack(); ++i) pump (20);
+    std::printf ("learned track: %s, effective start bar %d\n", proc.hasLearnedTrack() ? "yes" : "NO", proc.getEffectiveStartBar());
+    proc.autoPair();
+    for (int i = 0; i < 300; ++i)
+    {
+        pump (30);
+        bool all = true;
+        for (auto& p : proc.getPairs()) all = all && p.analyzed;
+        if (all && ! proc.getPairs().empty()) break;
+    }
+    std::printf ("%s\n", proc.getLearnMessage().toRawUTF8());
+    for (int i = 0; i < (int) proc.getPairs().size(); ++i)
+    {
+        const auto& p = proc.getPairs()[(size_t) i];
+        const char* light[] = { "--", "GREEN", "AMBER", "RED" };
+        std::printf ("\nPAIR %d: your bars %d-%d (song %d-%d) -> ref %c bars %d-%d  %s  light %s  measured from bar %d\n", i + 1,
+                     proc.getEffectiveStartBar() + p.songStart, proc.getEffectiveStartBar() + p.songEnd - 1, p.songStart, p.songEnd,
+                     p.slot == 0 ? 'A' : 'B', p.refStart + 1, p.refStart + p.refBars, p.breakdown ? "BREAKDOWN" : "drop",
+                     light[p.status], proc.getEffectiveStartBar() + p.measureStart);
+        std::printf ("  kick numbers you/ref: rise %.1f/%.1f ms click %.1f/%.1f dB decay %.0f/%.0f ms\n", p.youM.kick.riseMs, p.refM.kick.riseMs,
+                     p.youM.kick.clickDb, p.refM.kick.clickDb, p.youM.kick.decayMs, p.refM.kick.decayMs);
+        std::printf ("  you: kick %s | bass %s | notes %s\n", p.youM.kick.label().toRawUTF8(),
+                     gs::bassPatternName (p.youM.bassPattern).toRawUTF8(), p.youM.bassNotes.describe().toRawUTF8());
+        std::printf ("  ref: kick %s | bass %s | notes %s\n", p.refM.kick.label().toRawUTF8(),
+                     gs::bassPatternName (p.refM.bassPattern).toRawUTF8(), p.refM.bassNotes.describe().toRawUTF8());
+        for (auto& r : p.coach.checks())
+            if (r.status != gs::Status::pass) std::printf ("    [%s] %s %s\n", statusName (r.status), r.name.toRawUTF8(), r.value.toRawUTF8());
+        for (auto& c : p.coach.cards())
+            std::printf ("    card: %s%s  (%s)\n", c.fixFirst ? "FIX FIRST " : "", c.title.toRawUTF8(), c.headline.toRawUTF8());
+    }
+
+    proc.matchAllPairs();
+    for (int i = 0; i < (int) proc.getPairs().size(); ++i)
+    {
+        const auto& c = proc.getPairs()[(size_t) i].corr;
+        std::printf ("pair %d correction: feel %+.1f punch %+.1f duck %+.1f %+.1f %+.1f %+.1f attack %+.1f tail %+.1f@%.0fms mud %+.1f lowcut %.0f mono %d weight %.1f\n",
+                     i + 1, c.feelDb, c.punchDb, c.duckDb[0], c.duckDb[1], c.duckDb[2], c.duckDb[3], c.attackDb, c.tailDb,
+                     c.tailStartMs, c.mudDb, c.lowCutHz, (int) c.mono, c.weight);
+    }
+    proc.selectPair (1);
+    pump (200);
+    std::printf ("\nselected pair 2: showing %s readout. Cards with what Ground Shake fixed:\n", proc.isShowingSavedPair() ? "SAVED" : "LIVE");
+    for (auto& c : proc.getDisplayCards())
+        std::printf ("  %s\n    fixed: %s\n", c.title.toRawUTF8(), c.fixed.toRawUTF8());
+
+    double inD = 0, outD = 0;
+    int blocksIn = 0;
+    playSong (true, &inD, &outD, &blocksIn);
+    std::printf ("\nplayback with corrections: max change inside pairs %.4f (%d blocks), outside pairs %.9f (must be 0)\n", inD, blocksIn, outD);
+
+    // hand-made pair over part of the first drop, then re-learn just that pair
+    proc.deletePair (0);
+    proc.selectPair (-1);                 // what dragging a new stretch does in the editor
+    proc.setWindowStartBar (0);
+    proc.addPair (0, 8);
+    for (int i = 0; i < 200; ++i) { pump (30); if (! proc.getPairs().empty() && proc.getPairs()[0].analyzed) break; }
+    std::printf ("manual pair: %d pairs, pair 1 bars %d-%d analyzed %d light %d | %s\n", (int) proc.getPairs().size(),
+                 proc.getEffectiveStartBar() + proc.getPairs()[0].songStart, proc.getEffectiveStartBar() + proc.getPairs()[0].songEnd - 1,
+                 (int) proc.getPairs()[0].analyzed, proc.getPairs()[0].status, proc.getLearnMessage().toRawUTF8());
+    proc.startLearnPair (0);
+    playSong (false, nullptr, nullptr, nullptr);
+    pump (300);
+    std::printf ("learn pair: state %s, %s\n", proc.getLearnState() == GroundShakeProcessor::LearnState::off ? "stopped by itself" : "STILL LEARNING",
+                 proc.getLearnMessage().toRawUTF8());
+    for (int i = 0; i < 200; ++i) { pump (30); if (proc.hasLearnedTrack() && proc.getPairs()[0].analyzed) break; }
+    for (int i = 0; i < (int) proc.getPairs().size(); ++i)
+        std::printf ("  after re-learn pair %d: bars %d-%d state %d analyzed %d breakdown %d lowcut %.0f light %d\n", i + 1,
+                     proc.getPairs()[(size_t) i].songStart, proc.getPairs()[(size_t) i].songEnd, (int) proc.getPairs()[(size_t) i].state,
+                     (int) proc.getPairs()[(size_t) i].analyzed, (int) proc.getPairs()[(size_t) i].breakdown,
+                     proc.getPairs()[(size_t) i].corr.lowCutHz, proc.getPairs()[(size_t) i].status);
+    inD = 0;  outD = 0;  blocksIn = 0;
+    proc.selectPair (1);
+    std::printf ("\nplayback with corrections: max change inside pairs %.4f (%d blocks), outside pairs %.9f (must be 0)\n", inD, blocksIn, outD);
+
+    // save and restore
+    juce::MemoryBlock state;
+    proc.getStateInformation (state);
+    GroundShakeProcessor proc2;
+    proc2.setPlayConfigDetails (2, 2, sr, block);
+    proc2.prepareToPlay (sr, block);
+    proc2.setStateInformation (state.getData(), (int) state.getSize());
+    pump (1500);
+    std::printf ("state: %d bytes; restored %d pairs, learned bars %d, pair 1 light %d, pair 2 corr lowcut %.0f\n", (int) state.getSize(),
+                 (int) proc2.getPairs().size(), proc2.getLearnedBars(), proc2.getPairs().empty() ? -1 : proc2.getPairs()[0].status,
+                 proc2.getPairs().size() > 1 ? proc2.getPairs()[1].corr.lowCutHz : -1.0f);
+
+    // screenshot with pair 2 selected
+    std::unique_ptr<juce::AudioProcessorEditor> ed (proc.createEditor());
+    ed->setSize (1400, 840);
+    for (int i = 0; i < 30; ++i) juce::MessageManager::getInstance()->runDispatchLoopUntil (17);
+    auto img = ed->createComponentSnapshot (ed->getLocalBounds(), true, 1.0f);
+    outPng.deleteFile();
+    juce::FileOutputStream os (outPng);
+    juce::PNGImageFormat().writeImageToStream (img, os);
+    std::printf ("saved %s\n", outPng.getFullPathName().toRawUTF8());
+    ed.reset();
+    return 0;
+}
+
 int main (int argc, char* argv[])
 {
     if (argc < 4) { std::printf ("usage: mix.wav ref.wav out.png [listenB|match|gain=dB]\n"); return 1; }
@@ -79,6 +257,9 @@ int main (int argc, char* argv[])
     gs::ReferenceTrack mix;  juce::String err;
     if (! gs::loadReference (juce::File (juce::String::fromUTF8 (argv[1])), mix, err)) { std::printf ("mix: %s\n", err.toRawUTF8()); return 1; }
     std::printf ("your mix: %s  (tempo used for the fake host: %.2f BPM)\n", mix.name.toRawUTF8(), mix.detectedBpm);
+    for (int a2 = 4; a2 < argc; ++a2)
+        if (juce::String (argv[a2]) == "phase3")
+            return runPhase3 (mix, juce::File (juce::String::fromUTF8 (argv[2])), juce::File (juce::String::fromUTF8 (argv[3])));
 
     // optional: change the mix's sub to test the checks (low shelf-ish boost/cut via a peak at 45 Hz)
     if (std::abs (lowGainDb) > 0.01f)

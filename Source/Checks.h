@@ -14,7 +14,8 @@ namespace gs
 {
 enum class CheckId
 {
-    section, mono, tuning, kickBass, beatShape, subLevel, punch, mud, squash, djPlayback,
+    section, kickType, bassPattern, bassNotes,          // sound check + note check come first
+    mono, tuning, kickBass, beatShape, subLevel, punch, mud, squash, djPlayback,
     numChecks,
     // information cards (never block the match %)
     fineTune, loudnessGap, keyInfo, oneBeat, thinMud
@@ -45,6 +46,8 @@ struct FixCard
     bool offerFindDrop = false, offerDismiss = false;
     juce::String dismissLabel = "THAT'S INTENDED";
     juce::String worse;                   // set when the reading has moved the wrong way since the card appeared
+    juce::String fixed;                   // Phase 3: what Ground Shake's correction already does about it
+    bool adviceOnly = false;              // a sound / note choice: you change it, the correction can't
     bool fixFirst = false;
 };
 
@@ -70,6 +73,8 @@ struct CoachInputs
     bool sectionDismissed = false;
     bool breakdownMode = false;           // the reference window is a low-sub section (muted kicks / bass)
     int breakdownBar = -1;
+    bool pairMode = false;                // Phase 3: comparing a pair you marked (no section check)
+    juce::String pairLabel;
     double hostBpm = 120.0;
     float djRefLevel = -9.0f;             // rekordbox Auto Gain reference level
 };
@@ -81,7 +86,8 @@ public:
     void takeSnapshot();
     void clearSnapshot() { snapValid = false; }
     bool hasSnapshot() const { return snapValid; }
-    void update (const CoachInputs& in, double nowSec);
+    // holdForLoop = false for saved readouts (a learned pair): passes tick straight away
+    void update (const CoachInputs& in, double nowSec, bool holdForLoop = true);
 
     const std::vector<CheckRow>& checks() const { return rows; }
     const std::vector<FixCard>& cards() const { return fixCards; }

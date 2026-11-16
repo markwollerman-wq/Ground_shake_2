@@ -23,6 +23,42 @@ struct RefPlayback
 enum class MatchState { off, ready, preview, applied };
 
 //==============================================================================
+// Phase 3: a pair = a stretch of YOUR learned track (song bars A-B) matched to a few bars
+// of a reference (slot A or B). Each pair has its own analysis, readout and correction.
+struct Pair
+{
+    int slot = 0;                       // reference A (0) or B (1)
+    int refStart = 0, refBars = 4;      // reference bars (from its grid)
+    int songStart = 0, songEnd = 8;     // your song bars, counted from the song start; end is exclusive
+    int measureStart = 0;               // the bars inside A-B the fix is measured from (picked automatically)
+    bool manual = true;                 // false = made by AUTO-PAIR
+    int colour = 0;
+
+    // analysis (saved with the project)
+    bool analyzed = false, needsLearn = false, breakdown = false;
+    gs::StepProfile you, ref;
+    gs::Measurements youM, refM;
+    juce::String refName;
+    int refDropBar = 0, refNumBars = 0;
+
+    // readout
+    gs::Coach coach;
+    int status = 0;                     // 0 = not measured, 1 green, 2 amber, 3 red
+
+    // correction
+    gs::MatchSettings corr;
+    MatchState state = MatchState::off;
+};
+
+// What the audio thread needs to switch corrections by playhead position
+struct CorrectionTable
+{
+    struct Entry { double startPpq, endPpq; gs::MatchSettings s; bool active, levelMatch; };
+    std::vector<Entry> entries;
+    bool pairMode = false;              // true: unmarked parts are left alone
+};
+
+//==============================================================================
 class GroundShakeProcessor : public juce::AudioProcessor, private juce::Timer
 {
 public:
@@ -53,7 +89,7 @@ public:
 
     //==========================================================================
     // Message-thread API used by the editor
-    void loadReferenceAsync (const juce::File& file);
+    void loadReferenceAsync (const juce::File& file, int slot = -1);   // -1 = the slot on show
     bool isLoading() const { return loading.load(); }
     juce::String getLoadError() const { return loadError; }
     bool hasReference() const { return reference != nullptr; }
@@ -129,6 +165,57 @@ public:
 
     std::function<void()> onReferenceChanged;                  // editor refresh hook
 
+    //==========================================================================
+    // Phase 3: reference slots, learn pass, pairs, follow playhead
+    int getActiveSlot() const { return activeSlot; }
+    void setActiveSlot (int slot);
+    juce::String getSlotName (int slot) const;
+    bool slotHasReference (int slot) const;
+
+    int getSongStartBar() const { return songStartBar; }        // Ableton bar; 0 = auto
+    void setSongStartBar (int bar);
+    int getEffectiveStartBar() const { return originBar + trimBars; }
+    int getOriginBar() const { return originBar; }
+    int getTrimBars() const { return trimBars; }
+
+    enum class LearnState { off, song, pair };
+    LearnState getLearnState() const { return learnState; }
+    void startLearn();                                           // the whole song
+    void startLearnPair (int index);                             // just one pair's bars
+    void stopLearn();
+    bool hasLearnedTrack() const { return learnedTrack != nullptr; }
+    int getLearnedBars() const { return learnedBars; }           // song bars with a waveform
+    const std::vector<float>& getLearnedOverviewMin() const { return ovMin; }
+    const std::vector<float>& getLearnedOverviewMax() const { return ovMax; }
+    juce::String getLearnMessage() const { return learnMessage; }
+    double getSongBarNow() const;                                // where the playhead is, in song bars (-1 = before the start)
+
+    const std::vector<Pair>& getPairs() const { return pairs; }
+    int getSelectedPair() const { return selectedPair; }
+    void selectPair (int index, bool fromFollow = false);
+    void addPair (int songStart, int songEnd);                   // uses the current reference window
+    void deletePair (int index);
+    void setPairRange (int index, int songStart, int songEnd);
+    void autoPair();
+    void matchAllPairs();
+    bool isFollowingPlayhead() const { return followPlayhead; }
+    void setFollowPlayhead (bool on);
+
+    // the readout the editor shows: the selected pair's saved results, or live
+    bool isShowingSavedPair() const;
+    const gs::Coach& getDisplayCoach() const;
+    std::vector<gs::FixCard> getDisplayCards() const;
+    gs::StepProfile getDisplayYouProfile() const;
+    const gs::StepProfile& getDisplayRefProfile() const;
+    gs::Measurements getDisplayYouMeasurements() const;
+    const gs::Measurements& getDisplayRefMeasurements() const;
+    bool isDisplayBreakdown() const;
+
+    // the correction the panel edits: the selected pair's, or the global one
+    const gs::MatchSettings& getEditedCorrection() const;
+    MatchState getEditedMatchState() const;
+    void setEditedCorrection (const gs::MatchSettings& s);      // a hand tweak: switches it on
+
     // test hook: run the live analysis now (normally a background thread does this every second)
     void runLiveAnalysisNow() { runLiveAnalysis(); }
     void updateCoachNow() { updateCoach(); }
@@ -144,6 +231,17 @@ private:
     void runLiveAnalysis();
     void updateCoach();
     void pushMatchToAudio();
+    void pushCorrectionTable();
+    void savePhase3 (juce::XmlElement&) const;
+    void loadPhase3 (const juce::XmlElement&);
+    void analyzePair (int index);
+    void finishLearn();
+    void refreshPairCoach (Pair& p, int index);
+    gs::MatchSettings autoCorrection (const Pair& p) const;
+    std::shared_ptr<gs::ReferenceTrack> slotTrack (int slot) const;
+    double slotBpm (int slot) const;
+    double slotOffset (int slot) const;
+    int slotDropBar (int slot) const;
     void updateSections();
     void applyHostLoop();
 
@@ -204,9 +302,15 @@ private:
     std::atomic<int> loopStepsParam { gs::kLoopSteps }, hostLoopBars { 0 };
     std::atomic<float> ceilingDb { -1.0f };
 
-    // match settings for the audio thread
-    std::atomic<float> mFeel { 0.0f }, mPunch { 0.0f }, mWeight { 0.0f }, mFeelHz { 0.0f };
-    std::atomic<bool> mMono { false }, mActive { false }, mLevelMatch { false };
+    // corrections for the audio thread (swapped by pointer, old tables freed later)
+    std::atomic<CorrectionTable*> liveTable { nullptr };
+    std::unique_ptr<CorrectionTable> ownedTable;
+    std::vector<std::pair<std::unique_ptr<CorrectionTable>, juce::uint32>> retiredTables;
+
+    // learn pass
+    gs::SongRecorder recorder;
+    std::atomic<bool> learning { false };
+    std::atomic<double> learnOriginPpq { 32.0 };
 
     // live measurements (background thread -> UI)
     mutable juce::CriticalSection liveMLock;
@@ -236,6 +340,34 @@ private:
     gs::MatchSettings matchSettings;
     LiveAnalyzer analyzer { *this };
     int timerTicks = 0;
+
+    // Phase 3, message thread
+    struct ParkedSlot
+    {
+        std::shared_ptr<gs::ReferenceTrack> track;
+        std::shared_ptr<const juce::AudioBuffer<float>> resampled;
+        double resampledRate = 0, bpm = 0, offset = 0;
+        int windowStartBar = 0, dropBar = 0, breakdownBar = -1;
+        gs::Measurements refM;
+    };
+    std::array<ParkedSlot, 2> parked;
+    int activeSlot = 0;
+    int songStartBar = 9, originBar = 9, trimBars = 0, learnedBars = 0;
+    double learnBpm = 0;
+    LearnState learnState = LearnState::off;
+    int learnPairIndex = -1;
+    juce::String learnMessage;
+    std::shared_ptr<gs::ReferenceTrack> learnedTrack;
+    std::vector<float> ovMin, ovMax;                             // learned waveform, 32 points a bar
+    std::vector<Pair> pairs;
+    int selectedPair = -1, pairAnalysisRunning = 0;
+    bool followPlayhead = true;
+    std::vector<int> pairsToAnalyze;
+    int lastLivePair = -1;
+    std::unique_ptr<juce::PropertiesFile> globalSettings;
+    bool switchingForPair = false, buildRunning = false;
+    double otherPendingBpm = 0, otherPendingOffset = 0;
+    int otherPendingStart = -1;
 
     // restored state waiting for its file to load
     int pendingStartBar = -1;
