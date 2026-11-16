@@ -59,6 +59,8 @@ Readings that come from the finished master are estimates: the kick note in part
 | **MIX / OUT / MASTER** | Chooses what the checklist and cards describe. While a pair plays, MIX reads your mix before the correction and OUT reads what comes out. Kick attack and click readings in OUT are estimates until you play the section (the learned audio is stored at about 16 kHz). |
 | **Master check** | Your drop against the reference's drop, level-matched: tone balance above 120 Hz, stereo width above 300 Hz, low-end mono, limiter squash (crest) and drop loudness. Advice cards for your master chain (EQ, imager, limiter), plus where each goes: EQ, imager, limiter, then Ground Shake last. Updates after each LEARN. |
 
+Drop corrections are **kick-safe**: on the master the kick and bass share the low end, so the duck on the kick 16th skips the kick's first 20-35 ms, and the automatic correction never takes more than 1.5 dB of sub off a drop or ducks the kick 16th deeper than -4 dB (the knobs still go further by hand; the card warns if they do). Whatever pile-up is left is for Kickstart 2 on your bass channel.
+
 Phase 4 also fixes the built-in ducking, attack and tail bands: they now use a 1st-order split, so a cut is always a cut (the steeper split's phase could turn a duck into a small boost around 100 Hz).
 
 ## Use it in Ableton

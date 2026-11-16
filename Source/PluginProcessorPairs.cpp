@@ -110,6 +110,10 @@ namespace
 
     juce::String sdb (float v) { return (v >= 0 ? "+" : "-") + juce::String (std::abs (v), 1) + " dB"; }
 
+    // kick-safe limits for the automatic correction on drops (the knobs still go further by hand)
+    constexpr float kMaxAutoSubCut = -1.5f;      // FEEL
+    constexpr float kMaxAutoKickDuck = -4.0f;    // DUCK on the kick 16th
+
     // A stretch of a reference, anti-alias filtered and resampled to the learned track's rate,
     // so both sides go through the same filters
     juce::AudioBuffer<float> windowAtRate (const gs::ReferenceTrack& rt, int s0, int n0, double lsr)
@@ -794,12 +798,18 @@ void GroundShakeProcessor::simulatePair (int index)
                     if (worst < 0.8f) break;
                     if (bs.valid)
                     {
-                        // a kick-attack boost adds low end on the kick 16th: back it off before the duck runs out
-                        if (bs.diff[0] > 1.0f && c.duckDb[0] <= -9.0f && c.attackDb > 0.0f) c.attackDb = std::max (0.0f, c.attackDb - 1.5f);
+                        // kick 16th still too full once the (kick-safe) duck is at its limit: take it out of the
+                        // mud and the kick's ring first, never the kick's punch
+                        if (bs.diff[0] > 1.0f && c.duckDb[0] <= kMaxAutoKickDuck + 0.1f)
+                        {
+                            if (c.attackDb > 0.0f) c.attackDb = std::max (0.0f, c.attackDb - 1.5f);
+                            else if (c.mudDb > -6.0f) c.mudDb = std::max (-6.0f, c.mudDb - 1.5f);
+                        }
                         for (size_t k = 0; k < 4; ++k)
-                            if (std::abs (bs.diff[k]) >= 0.5f) c.duckDb[k] = juce::jlimit (-12.0f, 3.0f, c.duckDb[k] - 0.8f * bs.diff[k]);
+                            if (std::abs (bs.diff[k]) >= 0.5f)
+                                c.duckDb[k] = juce::jlimit (k == 0 ? kMaxAutoKickDuck : -12.0f, 3.0f, c.duckDb[k] - 0.8f * bs.diff[k]);
                     }
-                    if (std::abs (df) > 0.3f) c.feelDb = juce::jlimit (-6.0f, 6.0f, c.feelDb + 0.8f * df);
+                    if (std::abs (df) > 0.3f) c.feelDb = juce::jlimit (kMaxAutoSubCut, 6.0f, c.feelDb + 0.8f * df);
                     if (std::abs (dp) > 0.3f) c.punchDb = juce::jlimit (-6.0f, 6.0f, c.punchDb + 0.8f * dp);
                     outP = run (c);
                 }
@@ -895,6 +905,9 @@ gs::MatchSettings GroundShakeProcessor::autoCorrection (const Pair& p) const
     const float df = zoneGainDb (y.feelTotal, y.fullTotal, r.feelTotal, r.fullTotal);
     const float dp = zoneGainDb (y.punchTotal, y.fullTotal, r.punchTotal, r.fullTotal);
     c.feelDb = std::abs (df) > 0.3f ? juce::jlimit (-6.0f, 6.0f, df) : 0.0f;
+    // kick-safe on drops: never take more than 1.5 dB of sub off the whole mix (the mud cut and the
+    // card's Kickstart steps do the rest); breakdowns keep the full range
+    if (! p.breakdown) c.feelDb = std::max (c.feelDb, kMaxAutoSubCut);
     c.punchDb = std::abs (dp) > 0.3f ? juce::jlimit (-6.0f, 6.0f, dp) : 0.0f;
     c.feelHz = p.youM.valid && p.youM.bassConf >= 5.0f ? juce::jlimit (25.0f, split, p.youM.bassHz) : 0.0f;
     c.mono = p.youM.valid && p.youM.monoCorr < 0.9f;
@@ -904,7 +917,7 @@ gs::MatchSettings GroundShakeProcessor::autoCorrection (const Pair& p) const
         const auto bs = gs::beatShape (y, r);
         if (bs.valid)
             for (size_t k = 0; k < 4; ++k)
-                c.duckDb[k] = std::abs (bs.diff[k]) >= 1.5f ? juce::jlimit (-12.0f, 3.0f, -bs.diff[k]) : 0.0f;
+                c.duckDb[k] = std::abs (bs.diff[k]) >= 1.5f ? juce::jlimit (k == 0 ? kMaxAutoKickDuck : -12.0f, 3.0f, -bs.diff[k]) : 0.0f;
         // kick attack and tail
         if (p.youM.kick.valid && p.refM.kick.valid)
         {
@@ -1126,7 +1139,7 @@ std::vector<gs::FixCard> GroundShakeProcessor::getDisplayCards() const
                 break;
             case gs::CheckId::beatShape:
             case gs::CheckId::kickBass:
-                if (! duck.isEmpty()) f.add ("built-in ducking: " + duck.joinIntoString (", "));
+                if (! duck.isEmpty()) f.add ("kick-safe ducking (the kick's first hit is left alone): " + duck.joinIntoString (", "));
                 break;
             case gs::CheckId::kickType:
                 if (std::abs (c.attackDb) > 0.05f) f.add ("kick attack " + sdb (c.attackDb));
@@ -1149,6 +1162,11 @@ std::vector<gs::FixCard> GroundShakeProcessor::getDisplayCards() const
             default: break;
         }
         if (! f.isEmpty()) card.fixed = now + f.joinIntoString ("; ") + ". The steps below do it in your own tracks.";
+        // a correction that takes sub away is worth saying out loud
+        if ((card.id == gs::CheckId::subLevel || card.id == gs::CheckId::kickBass) && c.feelDb < -1.5f)
+            card.worse = "This correction takes " + sdb (-c.feelDb).fromFirstOccurrenceOf ("+", false, false) + " of sub off the whole mix. If the kick loses its weight on a club system, turn FEEL back towards 0 and clear the mud instead.";
+        if (card.id == gs::CheckId::kickBass && c.duckDb[0] < -6.0f)
+            card.worse = "The duck on the kick 16th is deep (" + sdb (c.duckDb[0]) + "). On the master it can't tell kick from bass: if the kick goes soft, set 16th 1 back to about -3 dB and duck the bass with Kickstart 2 instead.";
         else if (card.adviceOnly) card.fixed = "Advice only: Ground Shake can't change this for you.";
     }
     return cards;
@@ -1366,21 +1384,44 @@ namespace
                         + ", highs " + db1 (dHigh) + ".";
                 c.cause = worst->d < 0 ? "The mix is darker or thinner there than the reference, so the drop sounds duller next to it in a DJ set."
                                        : "The mix has more there than the reference, so the drop can sound harsh or boxy next to it.";
-                for (auto& b : bands)
+                // how much EQ it really takes: boosting a band also raises the total it's measured against,
+                // so the reading moves less than the boost. Solve for the gain that gives the reference's share,
+                // and allow for a Q 0.7 bell only covering part of a wide band.
+                auto needDb = [&] (int band)
                 {
+                    const double f = juce::jlimit (1.0e-4, 0.98, std::pow (10.0, rel (y, band) / 10.0));
+                    const double t = juce::jlimit (1.0e-4, 0.98, std::pow (10.0, rel (r, band) / 10.0));
+                    return (float) (1.7 * 10.0 * std::log10 (t * (1.0 - f) / (f * (1.0 - t))));
+                };
+                const int bandIds[] = { (int) B::bHigh, (int) B::bMid, (int) B::bBody };
+                constexpr float kMasterMax = 3.0f;             // more than this on a master EQ starts to sound like EQ
+                bool tooMuch = false;
+                for (int k = 0; k < 3; ++k)
+                {
+                    const auto& b = bands[k];
                     if (std::abs (b.d) < 1.5f) continue;
-                    const float g = juce::jlimit (0.5f, 3.0f, half (std::abs (b.d) * 0.6f));
+                    const float need = needDb (bandIds[k]);
+                    const float g = juce::jlimit (0.5f, kMasterMax, half (std::abs (need)));
+                    tooMuch = tooMuch || std::abs (need) > kMasterMax + 0.75f;
                     const juce::String hz = b.hz >= 1000 ? juce::String (b.hz / 1000.0f, 1) + " kHz" : juce::String ((int) b.hz) + " Hz";
+                    const juce::String needTxt = " (the gap needs about " + juce::String (need >= 0 ? "+" : "") + juce::String (half (need), 1) + " dB in all)";
                     if (b.d < 0)
-                        c.how.add ("Ableton's EQ Eight on your master, before the limiter (or any EQ you like): a Bell, Q about 0.7, +" + juce::String (g, 1)
-                                   + " dB at " + hz + (b.hz >= 4000 ? ". Or a High Shelf from 3 kHz." : "."));
+                        c.how.add ("EQ Eight on your master, before the limiter: a Bell at " + hz + ", Q about 0.7. Add about +" + juce::String (g, 1)
+                                   + " dB more than you have now" + needTxt + (b.hz >= 4000 ? ". Or a High Shelf from 3 kHz." : "."));
                     else
-                        c.how.add ("EQ Eight on your master, before the limiter: a Bell, Q about 0.7, -" + juce::String (g, 1) + " dB at " + hz
+                        c.how.add ("EQ Eight on your master, before the limiter: a Bell at " + hz + ", Q about 0.7. Take about -" + juce::String (g, 1)
+                                   + " dB more off than you have now" + needTxt
                                    + (b.hz >= 4000 ? ". If it's harsh rather than just bright, find the harsh sound (hats, a lead) and cut it on its own channel instead." : "."));
                 }
-                c.how.add ("Start at about half the gap and listen: EQ on the master moves everything, so small moves go a long way.");
-                c.worked = "This row goes green after you re-learn (or play the drop in Ableton with the MASTER view open).";
-                c.tooFar = "If the reading flips the other way, or the drop starts to sound thin or brittle, back off.";
+                c.how.add ("Keep the master bell within about +/-3 dB in total. Re-learn after each change: this card counts from what it hears, so it always says how much MORE to add.");
+                if (tooMuch)
+                    c.how.add (worst->d < 0
+                                   ? "The gap is bigger than master EQ should close: the reference has more going on in the " + juce::String (worst->name)
+                                         + " (synths, chords, vocals, a lead). Bring those up in your mix, or add a part there, and keep the master EQ gentle."
+                                   : "The gap is bigger than master EQ should close: one or two parts carry too much in the " + juce::String (worst->name)
+                                         + ". Turn those down or cut them on their own channels, and keep the master EQ gentle.");
+                c.worked = "This row goes green after you re-learn. EQ Eight must sit before Ground Shake on the master, or Ground Shake can't hear it.";
+                c.tooFar = "If the reading flips the other way, or the drop starts to sound honky, thin or brittle, back off.";
                 c.watch = "If one sound causes it (a bright hat, a boxy synth), fixing that channel beats EQ on the whole master.";
                 cards.push_back (c);
             }

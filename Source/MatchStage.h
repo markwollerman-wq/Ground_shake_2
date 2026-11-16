@@ -150,7 +150,11 @@ public:
                     const double ramp = juce::jmin ((ms - cur.tailStartMs) / 20.0, (beatMs * 0.5 - ms) / 20.0, 1.0);
                     tailDb = cur.tailDb * (float) ramp;
                 }
-                const float tLow = juce::Decibels::decibelsToGain (cur.duckDb[(size_t) k] + tailDb);
+                // kick-safe: on the master the kick and bass share the low end, so the duck on the kick
+                // 16th waits out the kick's first hit (20-35 ms) and only clears what rings on after it
+                float duck = cur.duckDb[(size_t) k];
+                if (k == 0) duck *= (float) juce::jlimit (0.0, 1.0, (ms - 20.0) / 15.0);
+                const float tLow = juce::Decibels::decibelsToGain (duck + tailDb);
                 gLow = tLow + g2ms * (gLow - tLow);
                 // kick attack: the first ~12 ms of the beat, easing back by 30 ms
                 const float attShape = ms < 12.0 ? 1.0f : (ms < 30.0 ? (float) (1.0 - (ms - 12.0) / 18.0) : 0.0f);

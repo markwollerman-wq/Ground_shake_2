@@ -73,6 +73,16 @@ static int runPhase3 (gs::ReferenceTrack& mix, const juce::File& refFile, const 
     for (int part = 0; part < 5; ++part)
         for (int c = 0; c < 2; ++c)
             song.copyFrom (c, part * clipLen, part == 2 ? lp : mix.audio, c, 0, clipLen);
+    if (const char* me = std::getenv ("GS_MIDEQ"))           // a master EQ on the whole song: bell at 900 Hz, Q 0.7
+    {
+        const float gdb = (float) std::atof (me);
+        for (int c = 0; c < 2; ++c)
+        {
+            gs::Biquad bq;  bq.setPeak (sr, 900.0, 0.7, gdb);
+            for (int i = 0; i < song.getNumSamples(); ++i) song.setSample (c, i, bq.process (song.getSample (c, i)));
+        }
+        std::printf ("song EQ: bell %+.1f dB at 900 Hz\n", gdb);
+    }
     std::printf ("song: %d bars at %.2f BPM, starting at Ableton bar 9 (drop %d, breakdown %d (low-passed), drop %d)\n",
                  songBars, bpm, 2 * clipBars, clipBars, 2 * clipBars);
 
